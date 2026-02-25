@@ -29,8 +29,8 @@ Because `miniBSE` relies on C++ extensions, **Conda is the highly recommended in
    ```
 2. Create and activate the environment:
    ```bash
-   conda env create -f environment.yml
-   conda activate minibse_env
+   micromamba env create -f environment.yml
+   micromamba activate minibse_env
    ```
    *(Note: The `environment.yml` automatically installs the `miniBSE` package in editable mode via pip at the end of the process).*
 
