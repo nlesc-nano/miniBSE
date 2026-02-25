@@ -1,45 +1,59 @@
 # miniBSE
 
-**miniBSE** is a lightweight, high-performance post-DFT exciton solver designed for the study of excited states in molecular and nanocluster systems. It leverages a C++ backend for fast integral evaluation and Python for advanced wavefunction analysis and diagonalization.
+**miniBSE** is a high-performance, lightweight post-DFT exciton solver designed for calculating and analyzing the excited states of molecules and semiconductor nanoclusters. 
 
-## Key Features
+By combining the ease of a Python interface with a lightning-fast C++ backend powered by `Libint2` and `Eigen3`, `miniBSE` offers researchers a scalable tool to investigate light-matter interactions, exciton delocalization, and charge-transfer (CT) characteristics without the overhead of massive quantum chemistry suites.
 
-* **Fast Integral Engine**: Utilizes a C++ backend powered by `Libint2` and `Eigen3` to compute AO overlaps, dipole matrices, and analytic Fourier transforms.
-* **Flexible Solver**: Supports both full dense diagonalization and the iterative **Davidson algorithm** for handling large transition spaces.
-* **Advanced Exciton Descriptors**: Includes comprehensive spatial analysis based on the Dreuw/Plasser framework:
-    * Exciton size ($d_{eh}$) and participation ratio (PR).
-    * Electron-hole spatial correlation (Pearson $R$).
-    * Charge transfer distance ($d_{CT}$) and particle RMS spread ($\sigma_h$, $\sigma_e$).
-* **Physics-Based Screening**: Implements various screening models including SOS-polarizability, geometric, and dielectric confinement.
-* **3D Visualizations**: Generates volumetric `.cube` files for electron, hole, and transition densities.
-* **Automated Broadening**: Produces UV-Vis spectra with Gaussian or Lorentzian broadening.
+## What it Does
+
+At its core, `miniBSE` solves the **Bethe-Salpeter Equation (BSE)** under the Tamm-Dancoff Approximation (TDA). It constructs an active-space electron-hole Hamiltonian using:
+1. **DFT Ground State Data**: Takes Molecular Orbitals (MOs) and orbital energies from a prior ground-state DFT calculation.
+2. **Analytic Integrals**: Uses `Libint2` to instantly compute Gaussian basis set overlaps and dipole transition matrices in real-space.
+3. **Screened Coulomb Interactions**: Implements a distance-dependent Ohno-Klopman Coulomb kernel, screened by automated or user-defined bulk dielectric constants. Optional sTDA-like exchange kernels are also supported.
+4. **Iterative Diagonalization**: Deploys a Davidson algorithm (or full dense diagonalization) to extract the lowest-lying excited states and their oscillator strengths.
+
+Beyond calculating energies, `miniBSE` performs **extensive wavefunction analysis** based on the Dreuw/Plasser framework, outputting physical descriptors such as exciton radii ($d_{eh}$), spatial correlation (Pearson $R$), and volumetric transition densities.
+
+---
 
 ## Installation
 
-### Prerequisites
+Because `miniBSE` relies on C++ extensions, **Conda is the highly recommended installation method**. Our `environment.yml` handles the installation of C++ compilers, `CMake`, `Eigen3`, and `Libint2`, saving you the hassle of system-level configurations.
 
-* **CMake** (>= 3.16)
-* **C++17** compatible compiler
-* **Libint2** and **Eigen3** libraries
-* **Python 3.12+**
+### Method 1: Conda (Recommended)
 
-### Setup
+1. Clone the repository:
+   ```bash
+   git clone [https://github.com/nlesc-nano/miniBSE.git](https://github.com/nlesc-nano/miniBSE.git)
+   cd miniBSE
+   ```
+2. Create and activate the environment:
+   ```bash
+   conda env create -f environment.yml
+   conda activate minibse_env
+   ```
+   *(Note: The `environment.yml` automatically installs the `miniBSE` package in editable mode via pip at the end of the process).*
 
-Clone the repository and install it in editable mode using `pip`. The `setup.py` script will automatically invoke CMake to compile the C++ bindings:
+### Method 2: Standard Pip
+
+If you already have `CMake` (>= 3.16), a C++17 compiler, `Eigen3`, and `Libint2` installed natively on your OS:
 
 ```bash
-git clone https://github.com/nlesc-nano/miniBSE.git
+git clone [https://github.com/nlesc-nano/miniBSE.git](https://github.com/nlesc-nano/miniBSE.git)
 cd miniBSE
+pip install -r requirements.txt
 pip install -e .
 ```
 
-## Usage
+---
 
-After installation, the package provides a command-line interface tool named `minibse`.
+## How to Use It
 
-### Typical Command
+Once installed, the solver is accessible globally via the `minibse` command-line interface. 
 
-Below is a standard example for calculating the excited states of a semiconductor cluster (e.g., InAs):
+### Typical Calculation
+
+Below is a standard example for calculating the excited states of an Indium Arsenide (InAs) semiconductor cluster, computing the lowest states within a 2 eV threshold, and plotting the results:
 
 ```bash
 minibse \
@@ -58,12 +72,36 @@ minibse \
   --alpha 0.2
 ```
 
-### Argument Overview
+### CLI Argument Breakdown
 
-* `--mo_file`: Path to the molecular orbital coefficients.
-* `--qp_gap`: Target quasi-particle gap (eV) to determine the scissor shift.
-* `--e_thresh`: Energy threshold (eV) for CI space truncation.
-* `--material`: Pre-defined material properties for automated screening calculations.
-* `--exchange`: Activates the sTDA-like exchange term.
-* `--cube`: Generates 3D transition density files.
+**Inputs & Structure:**
+* `--mo_file`: Path to your molecular orbitals (supports `.txt` or `.npz` arrays).
+* `--xyz`: The Cartesian coordinates of your system.
+* `--basis_txt` & `--basis_name`: The basis set file and the specific basis name (e.g., CP2K MOLOPT format) used to generate the C++ integrals.
+
+**Physics & Truncation:**
+* `--qp_gap`: The target quasi-particle gap (in eV). `miniBSE` uses this to apply a "scissor shift" to the raw DFT HOMO-LUMO gap.
+* `--e_thresh`: Energy threshold (in eV). Truncates the active space by discarding electron-hole transitions that exceed this gap.
+* `--material`: Uses a built-in material database to estimate dielectric screening.
+* `--alpha`: Manually overrides the Coulomb screening factor ($\alpha$).
+* `--exchange`: Toggles the inclusion of the sTDA-like exchange matrix.
+
+**Solver & Output Controls:**
+* `--full-diag`: Forces full dense diagonalization. Omit this to use the iterative Davidson solver for larger systems.
+* `--nthreads`: Number of CPU threads dedicated to C++ integral generation and PyTorch matrix contractions.
+* `--sigma`: Broadening width (in eV) for the generated UV-Vis spectrum.
+* `--plot`: Generates PNG spectra and an interactive HTML diagnostic dashboard.
+* `--cube`: (Optional) Generates 3D volumetric `.cube` files of the brightest exciton's electron/hole densities.
+
+---
+
+## Outputs
+
+A successful run of `miniBSE` will yield several outputs in your working directory:
+
+1. **Standard Output**: A console table listing the excited states, energies, oscillator strengths, and primary orbital transitions (e.g., `HOMO -> LUMO+1`).
+2. **`spectrum.png` & `spectrum_nm.png`**: UV-Vis absorption spectra utilizing your requested broadening (`--sigma`). 
+3. **`exciton_analysis.html`**: An interactive Plotly dashboard. This visualizes exciton spatial correlations, sizes, and charge-transfer ratios across the energy spectrum.
+4. **`exciton_results.csv`**: (If `--write-csv` is used) Tabular data containing detailed spatial metrics ($d_{CT}$, $\sigma_h$, $\sigma_e$) for post-processing or tracking across MD trajectories.
+5. **Cube Files**: (If `--cube` is used) Volumetric densities ready to be visualized in software like VMD, PyMOL, or ChimeraX.
 

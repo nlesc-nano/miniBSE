@@ -1,0 +1,33 @@
+name: minibse_env
+channels:
+  - conda-forge
+  - pytorch
+  - defaults
+dependencies:
+  # Python version
+  - python>=3.12
+  
+  # C++ Build Toolchain & Libraries
+  - cxx-compiler
+  - cmake>=3.16
+  - pybind11>=2.10.0
+  - eigen>=3.4.0
+  - libint>=2.6.0
+  
+  # Core Python Dependencies
+  - numpy>=1.24.0
+  - scipy>=1.10.0
+  - pandas>=2.0.0
+  
+  # Visualization
+  - matplotlib>=3.7.0
+  - plotly>=5.14.0
+  
+  # Hardware Acceleration (PyTorch)
+  - pytorch>=2.0.0
+  
+  # Pip fallback for local installation
+  - pip
+  - pip:
+    - -e .
+
