@@ -1,0 +1,24 @@
+# Python build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Compiled Python files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Compiled C/C++ libraries
+*.so
+*.dylib
+*.dll
+*.o
+
+# CMake/Make artifacts (in case you build locally outside a dedicated folder)
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+CMakeScripts/
+
