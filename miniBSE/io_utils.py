@@ -4,6 +4,7 @@ import time
 import numpy as np
 import collections
 from scipy.sparse import issparse, csr_matrix
+import libint_cpp
 
 
 BOHR_PER_ANGSTROM = 1.889726124565062
@@ -183,7 +184,7 @@ def read_mos_auto(path, n_ao_total, verbose=False):
 
         return C, eps, occ
 
-    return read_mos_txt(path, n_ao_total, verbose=verbose)
+    return read_mos_txt_cc(path, n_ao_total, verbose=verbose)
 
 
 def read_mos_txt(path, n_ao_total, verbose=False):
@@ -267,4 +268,77 @@ def read_mos_txt(path, n_ao_total, verbose=False):
 
     return C, eps, occ
 
+def read_mos_txt_fast(path, n_ao_total, verbose=False):
+    t0 = time.perf_counter()
+
+    # 1. Global Replace in C-speed: Read entire file into memory and fix 'D' to 'E'
+    with open(path, 'r') as f:
+        raw_text = f.read().replace('D', 'E').replace('d', 'E')
+
+    # Split into lines once
+    lines = raw_text.splitlines()
+
+    C_blocks = []
+    eps_list = []
+    occ_list = []
+
+    i = 0
+    n_lines = len(lines)
+
+    while i < n_lines:
+        s = lines[i].strip()
+
+        # 2. Fast check for the header line (avoids splitting every single line)
+        if s and s[0].lstrip('+').isdigit():
+            toks = s.split()
+            
+            if all(t.lstrip("+").isdigit() for t in toks):
+                n_cols = len(toks)
+
+                # Energies (Assuming numbers are the last n_cols items on the line)
+                eps_list.extend(float(x) for x in lines[i+1].split()[-n_cols:])
+                
+                # Occupations
+                occ_list.extend(float(x) for x in lines[i+2].split()[-n_cols:])
+
+                # Coefficients block
+                block_lines = lines[i+3 : i+3+n_ao_total]
+                
+                # 3. Fast list comprehension to flatten the block
+                block_vals = [val for row in block_lines for val in row.split()[-n_cols:]]
+                
+                # Convert straight to a localized 2D NumPy array
+                C_blocks.append(np.array(block_vals, dtype=np.float32).reshape(n_ao_total, n_cols))
+
+                # Jump the index completely past this block
+                i += 3 + n_ao_total
+                continue
+
+        i += 1
+
+    if not C_blocks:
+        raise RuntimeError("No MO blocks detected")
+
+    # 4. Horizontally stack all blocks simultaneously 
+    C = np.hstack(C_blocks)
+    eps = np.array(eps_list, dtype=np.float32)
+    occ = np.array(occ_list, dtype=np.float32)
+
+    if verbose:
+        dt = time.perf_counter() - t0
+        print(f"[MOs] Parsed in {dt:.4f} s | C shape {C.shape}")
+
+    return C, eps, occ
+
+def read_mos_txt_cc(path, n_ao_total, verbose=False):
+    t0 = time.perf_counter()
+    
+    # 1 line of Python. C++ handles everything else.
+    C, eps, occ = libint_cpp.parse_cp2k_mos(path, n_ao_total)
+    
+    if verbose:
+        dt = time.perf_counter() - t0
+        print(f"[MOs] Parsed in {dt:.4f} s | C shape {C.shape}")
+        
+    return C, eps, occ
 

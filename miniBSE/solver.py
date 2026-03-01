@@ -2,10 +2,14 @@ import numpy as np
 import time
 from miniBSE.davidson import davidson
 from miniBSE.exciton_hamiltonian import ExcitonHamiltonian
-from miniBSE.hardness import build_gamma
+from miniBSE.hardness import build_gamma, build_yukawa_mnok
 
 class ExcitonSolver:
-    def __init__(self, C, eps, occ, overlap, atom_symbols, atom_coords, atom_ao_ranges, homo_index, n_occ, n_virt, scissor_ev, kernel, alpha, include_exchange=False, e_thresh=None, f_thresh=0.0, mu_ia_x=None, mu_ia_y=None, mu_ia_z=None, device="numpy"):
+    def __init__(self, C, eps, occ, overlap, atom_symbols, atom_coords, atom_ao_ranges, 
+                 homo_index, n_occ, n_virt, scissor_ev, kernel, alpha, material=None, 
+                 include_exchange=False, e_thresh=None, f_thresh=0.0, 
+                 mu_ia_x=None, mu_ia_y=None, mu_ia_z=None, device="numpy"):
+
         self.C = C
         self.overlap = overlap
         self.atom_ao_ranges = atom_ao_ranges
@@ -13,7 +17,21 @@ class ExcitonSolver:
         self.n_virt = n_virt
         self.homo_index = homo_index
 
-        gamma = build_gamma(atom_symbols=atom_symbols, coords=atom_coords, alpha=alpha)
+        if kernel.lower() == "yukawa":
+            print(f"  [Solver] Using Screened Yukawa-MNOK kernel for material: {material}")
+            gamma = build_yukawa_mnok(
+                atom_symbols=atom_symbols, 
+                coords=atom_coords, 
+                alpha=alpha, 
+                material_name=material
+            )
+        else:
+            print("  [Solver] Using standard Grimme sTDA MNOK kernel.")
+            gamma = build_gamma(
+                atom_symbols=atom_symbols, 
+                coords=atom_coords, 
+                alpha=alpha
+            ) 
 
         self.ham = ExcitonHamiltonian(
             C=C, eps=eps, overlap=overlap, atom_ao_ranges=atom_ao_ranges,

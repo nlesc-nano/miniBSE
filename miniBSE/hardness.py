@@ -29,7 +29,6 @@ HARDNESS_DICT = {
 # Material database:
 # (eps_inf, Bohr_diameter_A, lattice_A, bulk_gap_eV,
 #  eps_static, m_eff (reduced), E_LO_eV)
-
 MATERIAL_DB = {
     # Halide Perovskites
     "CSPBCL3":  (4.0, 25.0, 5.60, 3.00, 20.0, 0.15, 0.022),
@@ -109,11 +108,6 @@ def compute_polaron_dielectric(eps_inf, eps_static):
     if eps_static <= eps_inf:
         return eps_inf
     return (eps_inf * eps_static / (eps_static - eps_inf)) * np.log(eps_static / eps_inf)
-
-def compute_polaron_radius_nm(m_eff, E_LO_eV):
-    if m_eff <= 0 or E_LO_eV <= 0:
-        return 0.0
-    return 0.53 / np.sqrt(m_eff) * np.sqrt(1.0 / E_LO_eV)
 
 def get_cluster_size_metrics(coords_ang, atom_symbols=None, material_name=None):
     """Robust, rotation-invariant size metrics for nanoclusters/QDs (Angstrom).
@@ -195,6 +189,82 @@ def build_gamma(atom_symbols, coords, alpha, eta_dict=HARDNESS_DICT):
     damp_mat_au = 0.5 * (a_au[:, np.newaxis] + a_au[np.newaxis, :])
     gamma_au = 1.0 / np.sqrt(r_mat_au**2 + damp_mat_au**2)
     return alpha * gamma_au * HA_TO_EV
+
+def compute_polaron_radius_nm(m_eff, E_LO_eV):
+    if m_eff <= 0 or E_LO_eV <= 0:
+        return 0.0
+    return 0.53 / np.sqrt(m_eff) * np.sqrt(1.0 / E_LO_eV)
+
+# =====================================================================
+# NEW: Universal Beta-Tuned Yukawa-MNOK Kernel
+# =====================================================================
+def build_yukawa_mnok(atom_symbols, coords, alpha, material_name, eta_dict=HARDNESS_DICT):
+    """
+    Computes the Universal beta-tuned Yukawa-MNOK potential.
+    
+    - alpha: Used here as the dimensionless tuning parameter (beta) for the 
+             dielectric confinement turn-on rate.
+    - material_name: Used to fetch the bulk dielectric and Bohr radius.
+    """
+    BOHR_TO_ANG = 0.52917721
+    HA_TO_EV = 27.211386
+    
+    # 1. Geometry: Get the Quantum Dot Radius (R_QD) from Convex Hull volume
+    metrics = get_cluster_size_metrics(coords, atom_symbols, material_name)
+    R_QD_ang = metrics['R_eff_hull']
+    
+    # 2. Material Data: Fetch eps_bulk and Bohr Exciton Radius
+    m_name = material_name.upper() if material_name else "DEFAULT"
+    entry = MATERIAL_DB.get(m_name, MATERIAL_DB["DEFAULT"])
+    
+    eps_bulk = entry[0]
+    db_bohr_diam_ang = entry[1]
+    
+    # The Exciton Bohr Radius (a_B) is half the database diameter
+    a_B_ang = db_bohr_diam_ang / 2.0 if db_bohr_diam_ang > 0 else 10.0
+    
+    # 3. Size-Dependent Effective Dielectric Constant (Resta/Geometric Model)
+    # Here, your CLI argument "alpha" is mapped to the physics parameter "beta"
+    beta_tune = alpha 
+    confinement_ratio = R_QD_ang / a_B_ang
+    
+    # Exponential turn-on function
+    interp_factor = 1.0 - np.exp(-beta_tune * confinement_ratio)
+    eps_eff = 1.0 + (eps_bulk - 1.0) * interp_factor
+    
+    # 4. Setup the Final Screened Kernel Parameters
+    c_screen = 1.0 / eps_eff
+    
+    # Inverse screening length for the exponential tail (in atomic units)
+    a_B_au = a_B_ang / BOHR_TO_ANG
+    k_s = 1.0 / a_B_au if a_B_au > 0 else 0.0
+    
+    # --- Informative Print Statements ---
+    print("\n    [Kernel: Universal β-Yukawa-MNOK]")
+    print(f"    Material            = {m_name}")
+    print(f"    R_QD (hull_eff)     = {R_QD_ang:.3f} Å")
+    print(f"    a_B  (exciton)      = {a_B_ang:.3f} Å")
+    print(f"    Confinement Ratio   = {confinement_ratio:.3f} (R_QD / a_B)")
+    print(f"    β (tuning param)    = {beta_tune:.3f}")
+    print(f"    ε_bulk (database)   = {eps_bulk:.3f}")
+    print(f"    ε_eff  (computed)   = {eps_eff:.3f}")
+    print(f"    Prefactor (1/ε_eff) = {c_screen:.4f}")
+    print(f"    Yukawa Tail (k_s)   = {k_s:.4f} a.u.^-1\n")
+    
+    # 5. Build Distance and Hardness Matrices
+    coords_au = coords / BOHR_TO_ANG
+    r_mat_au = squareform(pdist(coords_au))
+    
+    etas_au = np.array([eta_dict[s.lower()] for s in atom_symbols]) / HA_TO_EV
+    a_au = 1.0 / etas_au
+    damp_mat_au = 0.5 * (a_au[:, np.newaxis] + a_au[np.newaxis, :])
+    
+    # 6. The Screened Yukawa-MNOK Math
+    mnok_denom_au = np.sqrt(r_mat_au**2 + damp_mat_au**2)
+    gamma_au = c_screen * np.exp(-k_s * r_mat_au) / mnok_denom_au
+    
+    return gamma_au * HA_TO_EV
+
 
 def compute_sos_polarizability(mu_ia_x, mu_ia_y, mu_ia_z, delta_e_ia_ev):
     delta_e_au = delta_e_ia_ev / 27.211386

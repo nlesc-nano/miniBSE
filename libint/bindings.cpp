@@ -5,6 +5,7 @@
 #include <pybind11/eigen.h>          // Eigen ↔ NumPy
 #include <string>                    // Required for std::string
 #include <libint2.hpp>               // Required for libint2 headers
+#include "cp2k_parser.hpp"
 // #include <complex>  // -> uncomment when returning complex to Python
 
 
@@ -106,6 +107,7 @@ convert_projectors(const py::list& py_projectors)
 PYBIND11_MODULE(libint_cpp, m)
 {
   m.doc() = "High-level libint2 wrappers (overlap, dipole, spin-orbit)";
+  m.doc() = "C++ backend for miniBSE (libint & parsers)";
 
   // Add a function to return the Libint version string
   m.def("version", []() {
@@ -270,5 +272,8 @@ PYBIND11_MODULE(libint_cpp, m)
           py::arg("shells"), py::arg("C"), py::arg("pts"), py::arg("nthreads") = 1,
           "Evaluates active MOs directly on a grid to avoid massive Python memory transfers.");
 
+    m.def("parse_cp2k_mos", &parse_cp2k_mos_cpp, 
+          "Ultra-fast C++ parser for CP2K MO text files",
+          py::arg("filename"), py::arg("n_ao_total"));
 
 }

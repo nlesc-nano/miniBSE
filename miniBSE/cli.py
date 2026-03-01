@@ -48,7 +48,7 @@ def main():
                         help="Quasi-particle gap in eV (replaces scissor)")
     parser.add_argument("--soc", type=float, default=0.0, 
                         help="Spin-orbit coupling correction in eV. Shifts excitation energies down.")
-    parser.add_argument("--kernel", choices=["bse", "stda"], default="bse")
+    parser.add_argument("--kernel", choices=["bse", "stda", "yukawa"], default="bse")
     parser.add_argument("--alpha", type=float, default=None, help="Manual screening factor. Overrides automatic screening computation.")
     parser.add_argument("--exchange", action="store_true", help="Activate STDA-like exchange term")
     parser.add_argument("--screening", choices=["auto", "geometric", "polariz", "hybrid", "dielectric_conf"],
@@ -82,6 +82,7 @@ def main():
     parser.add_argument("--write-csv", action="store_true", help="Enable exporting results to a CSV file")
     parser.add_argument("--csv-roots", type=int, default=10, help="Number of roots to include in the CSV")
     parser.add_argument("--time", type=float, default=0.0, help="Current time in the MD trajectory (fs or ps)")
+    parser.add_argument("--save-xia", action="store_true", help="Save BSE eigenvectors (X_ia) to a compressed .npz file for NAMD overlaps")
 
     args = parser.parse_args()
 
@@ -228,6 +229,7 @@ def main():
         atom_ao_ranges=atom_ao_ranges, homo_index=homo_index,
         n_occ=n_occ, n_virt=n_virt, scissor_ev=scissor, kernel=args.kernel,
         alpha=alpha, include_exchange=args.exchange, 
+        material=args.material,
         e_thresh=args.e_thresh, f_thresh=args.f_thresh, 
         mu_ia_x=mu_ia_x, mu_ia_y=mu_ia_y, mu_ia_z=mu_ia_z,
         device=compute_device
@@ -392,6 +394,34 @@ def main():
                     f"{res['PR']:.3f}", "...", f"{res['d_eh']:.4f}", f"{res['d_CT']:.4f}", 
                     f"{res['sigma_h']:.4f}", f"{res['sigma_e']:.4f}", ex_type
                 ])
+
+    # ------------------------------------------------------------
+    # [NEW] Export BSE Eigenvectors (X_ia) for NAMD Diabatization
+    # ------------------------------------------------------------
+    if args.save_xia:
+        # Create a unique filename based on the trajectory time
+        # E.g., "xia_0008.00fs.npz"
+        npz_filename = f"xia_{args.time:08.2f}fs.npz"
+        
+        # Determine how many roots to save (usually match the CSV, or all computed roots)
+        n_to_write = min(args.csv_roots, len(energies_ev))
+        
+        print(f"\n--- [9] Exporting BSE Eigenvectors to {npz_filename} ---")
+        
+        # Save to a compressed binary format to save disk space and I/O time
+        np.savez_compressed(
+            npz_filename,
+            time=args.time,
+            energies=energies_ev[:n_to_write],
+            # vectors shape is (n_transitions, n_roots). We slice it to save only the roots we care about.
+            X_ia=vectors[:, :n_to_write], 
+            # Save the active space transition indices so we can align them between steps if the active space changes!
+            valid_i=solver.ham.valid_i,
+            valid_a=solver.ham.valid_a,
+            homo_index=homo_index,
+            n_occ=n_occ
+        )
+        print(f"  Successfully saved X_ia coefficients for {n_to_write} states.")
 
     # ------------------------------------------------------------
     # 10. Convolute Spectrum
