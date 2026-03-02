@@ -2,13 +2,13 @@ import numpy as np
 import time
 from miniBSE.davidson import davidson
 from miniBSE.exciton_hamiltonian import ExcitonHamiltonian
-from miniBSE.hardness import build_gamma, build_yukawa_mnok
+from miniBSE.hardness import build_gamma, build_resta_mnok # <-- Updated Import
 
 class ExcitonSolver:
     def __init__(self, C, eps, occ, overlap, atom_symbols, atom_coords, atom_ao_ranges, 
                  homo_index, n_occ, n_virt, scissor_ev, kernel, alpha, material=None, 
                  include_exchange=False, e_thresh=None, f_thresh=0.0, 
-                 mu_ia_x=None, mu_ia_y=None, mu_ia_z=None, device="numpy"):
+                 mu_ia_x=None, mu_ia_y=None, mu_ia_z=None, eps_out=2.0, device="numpy"): # <-- Added eps_out
 
         self.C = C
         self.overlap = overlap
@@ -17,13 +17,15 @@ class ExcitonSolver:
         self.n_virt = n_virt
         self.homo_index = homo_index
 
-        if kernel.lower() == "yukawa":
-            print(f"  [Solver] Using Screened Yukawa-MNOK kernel for material: {material}")
-            gamma = build_yukawa_mnok(
+        # <-- Updated to support "resta" (and "yukawa" for backward compat if desired)
+        if kernel.lower() in ["resta", "yukawa"]: 
+            print(f"  [Solver] Using Screened Resta-MNOK kernel for material: {material}")
+            gamma = build_resta_mnok(
                 atom_symbols=atom_symbols, 
                 coords=atom_coords, 
                 alpha=alpha, 
-                material_name=material
+                material_name=material,
+                eps_out=eps_out # <-- Pass eps_out to the model
             )
         else:
             print("  [Solver] Using standard Grimme sTDA MNOK kernel.")

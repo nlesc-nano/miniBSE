@@ -196,62 +196,63 @@ def compute_polaron_radius_nm(m_eff, E_LO_eV):
     return 0.53 / np.sqrt(m_eff) * np.sqrt(1.0 / E_LO_eV)
 
 # =====================================================================
-# NEW: Universal Beta-Tuned Yukawa-MNOK Kernel
+# NEW: Universal Tunable Resta-MNOK Kernel (Spatial Dispersion)
 # =====================================================================
-def build_yukawa_mnok(atom_symbols, coords, alpha, material_name, eta_dict=HARDNESS_DICT):
+def build_resta_mnok(atom_symbols, coords, alpha, material_name, eps_out=2.0, eta_dict=HARDNESS_DICT):
     """
-    Computes the Universal beta-tuned Yukawa-MNOK potential.
+    Computes the Resta-MNOK kernel with spatial dispersion.
     
-    - alpha: Used here as the dimensionless tuning parameter (beta) for the 
-             dielectric confinement turn-on rate.
-    - material_name: Used to fetch the bulk dielectric and Bohr radius.
+    - alpha: Universal dimensionless tuning parameter for dielectric confinement.
+    - material_name: Used to fetch bulk dielectric and filter core atoms for bond lengths.
+    - eps_out: Dielectric constant of the surrounding medium (e.g., ~2.0 for ligands/solvents).
     """
     BOHR_TO_ANG = 0.52917721
     HA_TO_EV = 27.211386
     
-    # 1. Geometry: Get the Quantum Dot Radius (R_QD) from Convex Hull volume
+    # 1. Geometry: Get R_QD and isolate core atoms for d_NN calculation
     metrics = get_cluster_size_metrics(coords, atom_symbols, material_name)
     R_QD_ang = metrics['R_eff_hull']
     
-    # 2. Material Data: Fetch eps_bulk and Bohr Exciton Radius
+    # Dynamically find the characteristic nearest-neighbor bond length (d_NN)
     m_name = material_name.upper() if material_name else "DEFAULT"
+    core_coords = coords
+    if m_name in MATERIAL_ELEMENTS:
+        core_elements = [el.lower() for el in MATERIAL_ELEMENTS[m_name]]
+        core_coords = np.array([coords[i] for i, sym in enumerate(atom_symbols) if sym.lower() in core_elements])
+    
+    if len(core_coords) > 1:
+        # Distance matrix of core atoms, fill diagonal with infinity to ignore self-distance
+        r_core_ang = squareform(pdist(core_coords))
+        np.fill_diagonal(r_core_ang, np.inf)
+        d_NN_ang = np.median(np.min(r_core_ang, axis=1))
+    else:
+        d_NN_ang = 2.5 # Safe fallback
+        
+    # 2. Material Data
     entry = MATERIAL_DB.get(m_name, MATERIAL_DB["DEFAULT"])
-    
     eps_bulk = entry[0]
-    db_bohr_diam_ang = entry[1]
+    a_B_ang = entry[1] / 2.0 if entry[1] > 0 else 10.0 # Exciton Bohr radius
     
-    # The Exciton Bohr Radius (a_B) is half the database diameter
-    a_B_ang = db_bohr_diam_ang / 2.0 if db_bohr_diam_ang > 0 else 10.0
-    
-    # 3. Size-Dependent Effective Dielectric Constant (Resta/Geometric Model)
-    # Here, your CLI argument "alpha" is mapped to the physics parameter "beta"
-    beta_tune = alpha 
+    # 3. Size-Dependent Effective Dielectric Constant
     confinement_ratio = R_QD_ang / a_B_ang
+    eps_eff = eps_out + (eps_bulk - eps_out) * (1.0 - np.exp(-alpha * confinement_ratio))
     
-    # Exponential turn-on function
-    interp_factor = 1.0 - np.exp(-beta_tune * confinement_ratio)
-    eps_eff = 1.0 + (eps_bulk - 1.0) * interp_factor
+    # 4. Tie screening length (k_s) to bulk dielectric and bond length
+    d_NN_au = d_NN_ang / BOHR_TO_ANG
+    k_s_au = np.sqrt(max(0.0, eps_bulk - 1.0)) / d_NN_au
     
-    # 4. Setup the Final Screened Kernel Parameters
-    c_screen = 1.0 / eps_eff
-    
-    # Inverse screening length for the exponential tail (in atomic units)
-    a_B_au = a_B_ang / BOHR_TO_ANG
-    k_s = 1.0 / a_B_au if a_B_au > 0 else 0.0
-    
-    # --- Informative Print Statements ---
-    print("\n    [Kernel: Universal β-Yukawa-MNOK]")
+    print("\n    [Kernel: Tunable Resta-MNOK]")
     print(f"    Material            = {m_name}")
     print(f"    R_QD (hull_eff)     = {R_QD_ang:.3f} Å")
-    print(f"    a_B  (exciton)      = {a_B_ang:.3f} Å")
+    print(f"    Characteristic Bond = {d_NN_ang:.3f} Å (d_NN)")
     print(f"    Confinement Ratio   = {confinement_ratio:.3f} (R_QD / a_B)")
-    print(f"    β (tuning param)    = {beta_tune:.3f}")
+    print(f"    α (tuning param)    = {alpha:.3f}")
+    print(f"    ε_out (environment) = {eps_out:.3f}")
     print(f"    ε_bulk (database)   = {eps_bulk:.3f}")
     print(f"    ε_eff  (computed)   = {eps_eff:.3f}")
-    print(f"    Prefactor (1/ε_eff) = {c_screen:.4f}")
-    print(f"    Yukawa Tail (k_s)   = {k_s:.4f} a.u.^-1\n")
+    print(f"    Inverse Screening   = {k_s_au:.4f} a.u.^-1 (k_s)\n")
     
-    # 5. Build Distance and Hardness Matrices
+    # 5. Build Matrices
     coords_au = coords / BOHR_TO_ANG
     r_mat_au = squareform(pdist(coords_au))
     
@@ -259,9 +260,12 @@ def build_yukawa_mnok(atom_symbols, coords, alpha, material_name, eta_dict=HARDN
     a_au = 1.0 / etas_au
     damp_mat_au = 0.5 * (a_au[:, np.newaxis] + a_au[np.newaxis, :])
     
-    # 6. The Screened Yukawa-MNOK Math
+    # 6. The Screened Resta-MNOK Math
     mnok_denom_au = np.sqrt(r_mat_au**2 + damp_mat_au**2)
-    gamma_au = c_screen * np.exp(-k_s * r_mat_au) / mnok_denom_au
+    c_screen = 1.0 / eps_eff
+    
+    # Formula: (1/eps_eff + (1 - 1/eps_eff) * exp(-k_s * R)) / sqrt(R^2 + a^2)
+    gamma_au = (c_screen + (1.0 - c_screen) * np.exp(-k_s_au * r_mat_au)) / mnok_denom_au
     
     return gamma_au * HA_TO_EV
 

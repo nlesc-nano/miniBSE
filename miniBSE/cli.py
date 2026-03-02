@@ -48,7 +48,7 @@ def main():
                         help="Quasi-particle gap in eV (replaces scissor)")
     parser.add_argument("--soc", type=float, default=0.0, 
                         help="Spin-orbit coupling correction in eV. Shifts excitation energies down.")
-    parser.add_argument("--kernel", choices=["bse", "stda", "yukawa"], default="bse")
+    parser.add_argument("--kernel", choices=["bse", "stda", "resta", "yukawa"], default="bse")
     parser.add_argument("--alpha", type=float, default=None, help="Manual screening factor. Overrides automatic screening computation.")
     parser.add_argument("--exchange", action="store_true", help="Activate STDA-like exchange term")
     parser.add_argument("--screening", choices=["auto", "geometric", "polariz", "hybrid", "dielectric_conf"],
@@ -59,6 +59,7 @@ def main():
     parser.add_argument("--material", type=str, default=None, help="Material name for auto-alpha")
     parser.add_argument("--eps-bulk", type=float, default=None, help="Override bulk dielectric constant")
     parser.add_argument("--L-scale", type=float, default=None, help="Override screening length")
+    parser.add_argument("--eps-out", type=float, default=2.0, help="Dielectric constant of the surrounding medium (ligands/solvent) for Resta kernel.")
 
     # Spectrum Broadening
     parser.add_argument("--broadening", choices=["gaussian", "lorentzian", "none"], default="gaussian")
@@ -232,6 +233,7 @@ def main():
         material=args.material,
         e_thresh=args.e_thresh, f_thresh=args.f_thresh, 
         mu_ia_x=mu_ia_x, mu_ia_y=mu_ia_y, mu_ia_z=mu_ia_z,
+        eps_out=args.eps_out,
         device=compute_device
     )
 
