@@ -115,201 +115,252 @@ class ExcitonAnalyzer:
         return results
 
 # ================= PLOTTING FUNCTIONS =================
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import numpy as np
 
-def plot_analysis_summary(analysis_results, physics_metrics=None, filename="exciton_analysis.html", show=True):
-    """
-    Generates a beautifully styled, interactive HTML dashboard using Plotly.
-    Includes MathJax for formulas and a detailed glossary of descriptors.
-    """
-    try:
-        import plotly.graph_objects as go
-        from plotly.subplots import make_subplots
-    except ImportError:
-        print("  [Warning] plotly is not installed. Skipping interactive plot generation.")
-        return
+def plot_analysis_summary(analysis_results, physics_metrics=None, filename=None, show=False, broadening="gaussian", sigma=0.1):
+    energies = [res['energy'] for res in analysis_results]
+    f_osc = [res['f_osc'] for res in analysis_results]
+    d_eh = [res['d_eh'] for res in analysis_results]
+    d_CT = [res['d_CT'] for res in analysis_results]
+    PR = [res['PR'] for res in analysis_results]
+    sigma_h = [res['sigma_h'] for res in analysis_results]
+    sigma_e = [res['sigma_e'] for res in analysis_results]
+    corr_eh = [res.get('corr_eh', 0) for res in analysis_results]
+    ct_ratio = [res.get('CT_Character', 0) for res in analysis_results]
 
-    energies = [r['energy'] for r in analysis_results]
-    f_osc = np.array([r['f_osc'] for r in analysis_results])
-    
-    # Size mapping for the bubbles
-    sizes = 8 + 25 * (f_osc / (np.max(f_osc) + 1e-6))
+    max_f = max(f_osc) if max(f_osc) > 0 else 1.0
+    marker_sizes = [8 + (f / max_f) * 20 for f in f_osc] 
 
+    # 3x2 Grid with a secondary Y-axis for the 6th plot
     fig = make_subplots(
         rows=3, cols=2,
         subplot_titles=(
-            "Exciton Delocalization (PR)", 
-            "Exciton Size (True d_eh)", 
-            "Particle Spread (\u03C3)", 
+            "Exciton Delocalization (PR)",
+            "Exciton Size (True d_eh)",
+            "Particle Spread (σ)",
             "Charge Transfer Distance (d_CT)",
-            "Spatial Correlation (Pearson R)"
+            "Spatial Correlation (Pearson R)",
+            "Simulated UV-Vis Spectrum"
         ),
-        vertical_spacing=0.1,
-        horizontal_spacing=0.08
+        horizontal_spacing=0.12,
+        vertical_spacing=0.15,
+        specs=[[{}, {}], [{}, {}], [{}, {"secondary_y": True}]] 
     )
 
-    # 1. PR
+    # --- ROW 1 ---
     fig.add_trace(go.Scatter(
-        x=energies, y=[r['PR'] for r in analysis_results],
-        mode='markers', hovertemplate="<b>Energy:</b> %{x:.3f} eV<br><b>PR:</b> %{y:.2f}<br><b>f:</b> %{text}<extra></extra>",
-        text=[f"{f:.4f}" for f in f_osc],
-        marker=dict(size=sizes, color=energies, colorscale='Viridis', line=dict(width=1, color='DarkSlateGrey')),
-        name='PR'), row=1, col=1)
+        x=energies, y=PR, mode='markers',
+        marker=dict(size=marker_sizes, color=energies, colorscale='Viridis', opacity=0.8, line=dict(width=1, color='black')),
+        name='PR', hovertemplate="Energy: %{x:.3f} eV<br>PR: %{y:.1f}<br>f_osc: %{customdata[0]:.4f}<extra></extra>",
+        customdata=np.column_stack([f_osc])
+    ), row=1, col=1)
 
-    # 2. d_eh
     fig.add_trace(go.Scatter(
-        x=energies, y=[r['d_eh'] for r in analysis_results],
-        mode='markers', hovertemplate="<b>Energy:</b> %{x:.3f} eV<br><b>d_eh:</b> %{y:.2f} Å<extra></extra>",
-        marker=dict(size=sizes, color='crimson', line=dict(width=1, color='DarkSlateGrey')),
-        name='d_eh'), row=1, col=2)
+        x=energies, y=d_eh, mode='markers',
+        marker=dict(size=marker_sizes, color='#d62728', opacity=0.7, line=dict(width=1, color='black')),
+        name='d_eh', hovertemplate="Energy: %{x:.3f} eV<br>d_eh: %{y:.2f} Å<br>f_osc: %{customdata[0]:.4f}<extra></extra>",
+        customdata=np.column_stack([f_osc])
+    ), row=1, col=2)
 
-    # 3. sigmas
+    # --- ROW 2 ---
     fig.add_trace(go.Scatter(
-        x=energies, y=[r['sigma_h'] for r in analysis_results],
-        mode='markers', name='Hole (\u03C3_h)',
-        marker=dict(size=sizes, color='royalblue', symbol='circle', opacity=0.7)), row=2, col=1)
+        x=energies, y=sigma_h, mode='markers',
+        marker=dict(size=marker_sizes, color='royalblue', symbol='circle', opacity=0.7, line=dict(width=1, color='white')),
+        name='Hole (σ_h)', hovertemplate="Energy: %{x:.3f} eV<br>σ_h: %{y:.2f} Å<extra></extra>"
+    ), row=2, col=1)
     
     fig.add_trace(go.Scatter(
-        x=energies, y=[r['sigma_e'] for r in analysis_results],
-        mode='markers', name='Electron (\u03C3_e)',
-        marker=dict(size=sizes, color='firebrick', symbol='square', opacity=0.7)), row=2, col=1)
+        x=energies, y=sigma_e, mode='markers',
+        marker=dict(size=marker_sizes, color='indianred', symbol='square', opacity=0.7, line=dict(width=1, color='white')),
+        name='Electron (σ_e)', hovertemplate="Energy: %{x:.3f} eV<br>σ_e: %{y:.2f} Å<extra></extra>"
+    ), row=2, col=1)
 
-    # 4. d_CT
-    ct_char = [r['CT_Character'] for r in analysis_results]
     fig.add_trace(go.Scatter(
-        x=energies, y=[r['d_CT'] for r in analysis_results],
-        mode='markers', hovertemplate="<b>d_CT:</b> %{y:.2f} Å<br><b>CT Ratio:</b> %{marker.color:.2f}<extra></extra>",
-        marker=dict(size=sizes, color=ct_char, colorscale='RdBu_r', cmin=0, cmax=1, 
-                    colorbar=dict(title="CT Ratio", x=1.02, y=0.5, len=0.3)),
-        name='d_CT'), row=2, col=2)
+        x=energies, y=d_CT, mode='markers',
+        marker=dict(
+            size=marker_sizes, color=ct_ratio, colorscale='RdBu_r', showscale=True, 
+            cmin=0, cmax=1, opacity=0.8, line=dict(width=1, color='black'),
+            colorbar=dict(title="CT Ratio", x=1.02, y=0.5, len=0.3)
+        ),
+        name='d_CT', hovertemplate="Energy: %{x:.3f} eV<br>d_CT: %{y:.2f} Å<br>CT Ratio: %{marker.color:.2f}<extra></extra>"
+    ), row=2, col=2)
 
-    # 5. Spatial Correlation
-    corr_vals = [r['corr_eh'] for r in analysis_results]
+    # --- ROW 3 ---
     fig.add_trace(go.Scatter(
-        x=energies, y=corr_vals,
-        mode='markers', marker=dict(size=sizes, color=corr_vals, colorscale='PiYG', cmin=-1, cmax=1,
-                    colorbar=dict(title="Pearson R", x=1.02, y=0.15, len=0.3)),
-        name='Correlation'), row=3, col=1)
+        x=energies, y=corr_eh, mode='markers',
+        marker=dict(
+            size=marker_sizes, color=corr_eh, colorscale='PiYG', showscale=True, 
+            cmin=-1, cmax=1, opacity=0.8, line=dict(width=1, color='black'),
+            colorbar=dict(title="Pearson R", x=0.45, y=0.15, len=0.3)
+        ),
+        name='Correlation', hovertemplate="Energy: %{x:.3f} eV<br>Pearson R: %{y:.3f}<extra></extra>"
+    ), row=3, col=1)
 
-    fig.update_layout(height=950, width=1100, template="plotly_white", showlegend=True, margin=dict(t=60))
-
-    if filename:
-        html_plot = fig.to_html(full_html=False, include_plotlyjs='cdn')
+    # --- 6. Simulated Spectrum Overlay ---
+    if broadening != "none" and len(energies) > 0:
+        # Import dynamically to avoid circular dependencies if any exist
+        from miniBSE.spectrum import generate_spectrum
         
-        # Physics Header
-        header_html = ""
-        if physics_metrics:
-            header_html = f"""
-            <div style="font-family: sans-serif; padding: 20px; background: #f8f9fa; border-radius: 10px; margin: 20px auto; max-width: 1100px; box-shadow: 0 4px 12px rgba(0,0,0,0.05);">
-                <h2 style="text-align: center; color: #2c3e50;">System Photophysics Summary</h2>
-                <div style="background: #eef2f5; padding: 10px; border-radius: 8px; text-align: center; margin-bottom: 20px;">
-                    \\( E_{{\\text{{opt}}}} = E_{{\\text{{gap}}}}^{{\\text{{DFT}}}} + \\Delta^{{\\text{{QP}}}} + \\Delta_{{\\text{{conf}}}} + E_{{\\text{{bind}}}} \\)
-                </div>
-                <div style="display: flex; justify-content: space-around; flex-wrap: wrap; gap: 10px;">
-                    <div style="text-align: center; border-left: 4px solid #3498db; padding: 10px; background: white; flex: 1;">
-                        <small>DFT GAP</small><br><b>{physics_metrics['dft_gap']:.3f} eV</b>
-                    </div>
-                    <div style="text-align: center; border-left: 4px solid #f39c12; padding: 10px; background: white; flex: 1;">
-                        <small>QP (SCISSOR)</small><br><b>+{physics_metrics['qp_correction']:.3f} eV</b>
-                    </div>
-                    <div style="text-align: center; border-left: 4px solid #2ecc71; padding: 10px; background: white; flex: 1;">
-                        <small>CONFINEMENT</small><br><b>+{physics_metrics['confinement_energy']:.3f} eV</b>
-                    </div>
-                    <div style="text-align: center; border-left: 4px solid #9b59b6; padding: 10px; background: white; flex: 1;">
-                        <small>BINDING ENERGY</small><br><b>{physics_metrics['binding_energy']:.3f} eV</b>
-                    </div>
-                    <div style="text-align: center; border-left: 4px solid #e74c3c; padding: 10px; background: white; flex: 1;">
-                        <small>S1 ENERGY</small><br><b>{physics_metrics['first_exc_energy']:.3f} eV</b>
-                    </div>
-                </div>
-            </div>
-            """
+        e_min = max(0.0, np.min(energies) - 2.5)
+        e_max = np.max(energies) + 2.5
+        x_grid, y_grid = generate_spectrum(energies, f_osc, e_min=e_min, e_max=e_max, sigma=sigma, profile=broadening)
+        
+        # Convoluted Envelope
+        fig.add_trace(go.Scatter(
+            x=x_grid, y=y_grid, mode='lines',
+            line=dict(color='black', width=1.5),
+            fill='tozeroy', fillcolor='rgba(65, 105, 225, 0.3)', 
+            name='Absorption Envelope', hoverinfo='skip', showlegend=False
+        ), row=3, col=2, secondary_y=False)
 
-        # Documentation Section
-        footer_html = """
-        <div style="font-family: sans-serif; margin: 20px auto; max-width: 1100px; background: white; padding: 25px; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.05);">
-            <h3 style="color: #2c3e50; border-bottom: 2px solid #ecf0f1; padding-bottom: 10px;">Glossary of Descriptors</h3>
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; font-size: 14px; line-height: 1.6;">
-                <div>
-                    <p><b>Circle Size (\(f\)):</b> Represents the Oscillator Strength. Larger bubbles indicate transitions that dominate the absorption spectrum.</p>
-                    <p><b>Participation Ratio (PR):</b> Quantifies delocalization. A higher PR indicates the exciton is spread over many orbital transitions.</p>
-                    <p><b>RMS Spread (\(\sigma_h, \sigma_e\)):</b> The spatial standard deviation of the hole and electron densities. High values imply diffuse charges.</p>
-                </div>
-                <div>
-                    <p><b>CT Distance (\(d_{CT}\)):</b> The distance between the center of the hole and the center of the electron. High \(d_{CT}\) indicates Charge Transfer character.</p>
-                    <p><b>Spatial Correlation (\(R\)):</b> Measures if the electron and hole move together. Positive \(R\) means they are "bound" in space; negative means they avoid each other.</p>
-                    <p><b>True Separation (\(d_{eh}\)):</b> The effective many-body distance between the pair, accounting for both \(d_{CT}\) and spatial fluctuations (\(\sigma\)).</p>
-                </div>
-            </div>
-        </div>
-        """
+    # Oscillator Strength Stems
+    fig.add_trace(go.Bar(
+        x=energies, y=f_osc, width=0.015, marker_color='crimson', opacity=0.8,
+        showlegend=False, hoverinfo='skip'
+    ), row=3, col=2, secondary_y=True)
+    
+    fig.add_trace(go.Scatter(
+        x=energies, y=f_osc, mode='markers',
+        marker=dict(color='crimson', size=6, line=dict(width=1, color='black')),
+        name='f_osc', showlegend=False,
+        hovertemplate="Energy: %{x:.3f} eV<br>f_osc: %{y:.4f}<extra></extra>"
+    ), row=3, col=2, secondary_y=True)
 
-        full_html = f"""
+    # --- AXES FORMATTING ---
+    for i in range(1, 4):
+        fig.update_xaxes(title_text="Energy (eV)", row=i, col=1)
+        if i < 4: fig.update_xaxes(title_text="Energy (eV)", row=i, col=2)
+
+    fig.update_yaxes(title_text="PR (States)", row=1, col=1)
+    fig.update_yaxes(title_text="Distance (Å)", row=1, col=2)
+    fig.update_yaxes(title_text="Spread (Å)", row=2, col=1)
+    fig.update_yaxes(title_text="Distance (Å)", row=2, col=2)
+    fig.update_yaxes(title_text="Pearson R", row=3, col=1)
+    
+    # Spectrum Axes
+    fig.update_yaxes(title_text="Intensity (a.u.)", row=3, col=2, secondary_y=False, rangemode="tozero")
+    fig.update_yaxes(title_text="f_osc", row=3, col=2, secondary_y=True, rangemode="tozero", color="crimson")
+
+    fig.update_layout(
+        height=1000, width=1400,
+        template="plotly_white",
+        margin=dict(t=40, r=120, b=60, l=80),
+        legend=dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.05)
+    )
+
+    # --- HTML EXPORT WITH CUSTOM HEADER & FOOTER ---
+    if filename:
+        m = physics_metrics or {}
+        
+        is_soc = m.get('is_soc', False)
+        if is_soc and 'soc_gap' in m:
+            gap_val = m['soc_gap']
+            gap_label = "SOC GAP"
+        else:
+            gap_val = m.get('dft_gap', 0)
+            gap_label = "DFT GAP"
+
+        gap_text = f"{gap_val:.3f} eV"
+        qp = f"{m.get('qp_correction', 0):+.3f} eV"
+        conf = f"{m.get('confinement_energy', 0):+.3f} eV"
+        bind = f"{m.get('binding_energy', 0):+.3f} eV"
+        s1 = f"{m.get('first_exc_energy', 0):.3f} eV"
+
+        html_template = f"""
+        <!DOCTYPE html>
         <html>
         <head>
-            <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
-            <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+            <meta charset="utf-8">
+            <style>
+                body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #f4f6f9; margin: 0; padding: 20px; }}
+                .dashboard-container {{ max-width: 1400px; margin: 0 auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }}
+                .header-title {{ text-align: center; color: #2c3e50; font-size: 28px; font-weight: 700; margin-bottom: 20px; }}
+                .equation-box {{ background-color: #f8f9fa; padding: 15px; text-align: center; border-radius: 8px; margin-bottom: 30px; font-size: 20px; color: #343a40; }}
+                .metrics-row {{ display: flex; justify-content: space-between; gap: 15px; margin-bottom: 40px; }}
+                .metric-card {{ flex: 1; background: white; padding: 15px 20px; text-align: center; border-radius: 6px; box-shadow: 0 2px 5px rgba(0,0,0,0.04); display: flex; flex-direction: column; justify-content: center; }}
+                .metric-label {{ font-size: 13px; font-weight: 600; color: #6c757d; letter-spacing: 0.5px; margin-bottom: 5px; text-transform: uppercase; }}
+                .metric-value {{ font-size: 20px; font-weight: 700; color: #212529; }}
+                .b-blue {{ border-left: 5px solid #4a90e2; }}
+                .b-orange {{ border-left: 5px solid #f39c12; }}
+                .b-green {{ border-left: 5px solid #2ecc71; }}
+                .b-purple {{ border-left: 5px solid #9b59b6; }}
+                .b-red {{ border-left: 5px solid #e74c3c; }}
+                .glossary-box {{ margin-top: 40px; padding: 25px; background-color: #f8f9fa; border-radius: 8px; border: 1px solid #e9ecef; }}
+                .glossary-title {{ font-size: 18px; font-weight: 700; color: #2c3e50; margin-bottom: 15px; }}
+                .glossary-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }}
+                .glossary-item strong {{ color: #343a40; font-size: 15px; display: block; margin-bottom: 4px; }}
+                .glossary-item p {{ margin: 0; font-size: 14px; color: #6c757d; line-height: 1.5; }}
+            </style>
         </head>
-        <body style="background: #ecf0f1; margin: 0; padding: 20px;">
-            {header_html}
-            <div style="margin: 0 auto; max-width: 1150px; background: white; padding: 20px; border-radius: 10px;">
-                {html_plot}
+        <body>
+            <div class="dashboard-container">
+                <div class="header-title">System Photophysics Summary { '(SOC)' if is_soc else '(Spin-Free)' }</div>
+                
+                <div class="equation-box">
+                    <i>E</i><sub>opt</sub> = <i>E</i><sub>gap</sub><sup>{ 'SOC' if is_soc else 'DFT' }</sup> + Δ<sup>QP</sup> + Δ<sub>conf</sub> + <i>E</i><sub>bind</sub>
+                </div>
+
+                <div class="metrics-row">
+                    <div class="metric-card b-blue">
+                        <div class="metric-label">{gap_label}</div>
+                        <div class="metric-value">{gap_text}</div>
+                    </div>
+                    <div class="metric-card b-orange">
+                        <div class="metric-label">QP (Scissor)</div>
+                        <div class="metric-value">{qp}</div>
+                    </div>
+                    <div class="metric-card b-green">
+                        <div class="metric-label">Confinement</div>
+                        <div class="metric-value">{conf}</div>
+                    </div>
+                    <div class="metric-card b-purple">
+                        <div class="metric-label">Binding Energy</div>
+                        <div class="metric-value">{bind}</div>
+                    </div>
+                    <div class="metric-card b-red">
+                        <div class="metric-label">S1 Energy</div>
+                        <div class="metric-value">{s1}</div>
+                    </div>
+                </div>
+
+                {fig.to_html(full_html=False, include_plotlyjs='cdn')}
+
+                <div class="glossary-box">
+                    <div class="glossary-title">Descriptor Glossary</div>
+                    <div class="glossary-grid">
+                        <div class="glossary-item">
+                            <strong>Participation Ratio (PR)</strong>
+                            <p>Measures the number of single-particle orbital transitions contributing to the exciton. A higher PR indicates greater multiconfigurational character and delocalization.</p>
+                        </div>
+                        <div class="glossary-item">
+                            <strong>True Exciton Size (d_eh)</strong>
+                            <p>The root-mean-square distance between the electron and hole density distributions, factoring in both their spread and their spatial separation.</p>
+                        </div>
+                        <div class="glossary-item">
+                            <strong>Particle Spread (σ_h, σ_e)</strong>
+                            <p>The spatial standard deviation of the individual hole (σ_h) and electron (σ_e) probability densities around their respective centers of mass.</p>
+                        </div>
+                        <div class="glossary-item">
+                            <strong>Charge Transfer Distance (d_CT)</strong>
+                            <p>The absolute distance between the spatial center of mass of the hole and the center of mass of the electron. Large values indicate significant charge-transfer character.</p>
+                        </div>
+                        <div class="glossary-item">
+                            <strong>Spatial Correlation (Pearson R)</strong>
+                            <p>Evaluates how strictly the electron and hole positions are correlated. Positive values indicate they localize in the same regions; negative values indicate spatial separation.</p>
+                        </div>
+                    </div>
+                </div>
             </div>
-            {footer_html}
         </body>
         </html>
         """
-        with open(filename, 'w', encoding='utf-8') as f: f.write(full_html)
-        print(f"  Interactive HTML dashboard saved to '{filename}'")
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(html_template)
+        print(f"  Saved Exciton Analysis dashboard to {filename}")
 
-    if show: fig.show()
-
-
-def plot_exciton_3d_plotly(coords, symbols, q_h, q_e, state_idx, energy, filename="exciton_3d.html"):
-    """
-    Plots the 3D real-space density of the hole and electron on the molecular framework.
-    """
-    try:
-        import plotly.graph_objects as go
-    except ImportError:
-        print("  [Warning] plotly is not installed. Skipping 3D HTML plot generation.")
-        return
-
-    color_map = {'PB': 'darkgrey', 'CS': 'purple', 'BR': 'saddlebrown', 'I': 'darkviolet', 'CL': 'green', 'IN': 'silver', 'AS': 'orange'}
-    base_colors = [color_map.get(s.upper(), 'lightgrey') for s in symbols]
-    fig = go.Figure()
-
-    # Base molecular structure
-    fig.add_trace(go.Scatter3d(
-        x=coords[:, 0], y=coords[:, 1], z=coords[:, 2],
-        mode='markers', marker=dict(size=3, color=base_colors, opacity=0.3),
-        name='Atomic Framework', hoverinfo='text',
-        text=[f"{s} {i}" for i, s in enumerate(symbols)]
-    ))
-
-    # Hole density
-    threshold = 0.002
-    h_idx = np.where(q_h > threshold)[0]
-    fig.add_trace(go.Scatter3d(
-        x=coords[h_idx, 0], y=coords[h_idx, 1], z=coords[h_idx, 2],
-        mode='markers', marker=dict(size=q_h[h_idx] * 400, color='blue', opacity=0.5, sizemode='diameter'),
-        name='Hole Density (+)', hoverinfo='text',
-        text=[f"Atom: {symbols[i]} | Hole Pop: {q_h[i]:.3f}" for i in h_idx]
-    ))
-
-    # Electron density
-    e_idx = np.where(q_e > threshold)[0]
-    fig.add_trace(go.Scatter3d(
-        x=coords[e_idx, 0], y=coords[e_idx, 1], z=coords[e_idx, 2],
-        mode='markers', marker=dict(size=q_e[e_idx] * 400, color='red', opacity=0.5, sizemode='diameter'),
-        name='Electron Density (-)', hoverinfo='text',
-        text=[f"Atom: {symbols[i]} | Elec Pop: {q_e[i]:.3f}" for i in e_idx]
-    ))
-
-    fig.update_layout(
-        title=f"Exciton Real-Space Density | State {state_idx} | E = {energy:.3f} eV",
-        scene=dict(xaxis_title='X (Å)', yaxis_title='Y (Å)', zaxis_title='Z (Å)', aspectmode='data'),
-        margin=dict(l=0, r=0, b=0, t=40)
-    )
-    
-    fig.write_html(filename)
+    if show:
+        fig.show()
 

@@ -342,3 +342,53 @@ def read_mos_txt_cc(path, n_ao_total, verbose=False):
         
     return C, eps, occ
 
+import collections
+
+def parse_gth_soc_potentials(path, elements_to_parse):
+    """Parses GTH potentials for SOC parameters."""
+    ecp_dict = collections.defaultdict(lambda: {'so': []})
+    needed_elements = set(elements_to_parse.keys())
+
+    def _collect_coeffs(line_iter, n, init):
+        coeffs = list(init)
+        while len(coeffs) < n:
+            line = next(line_iter).strip()
+            if line and not line.startswith('#'):
+                coeffs.extend([float(x) for x in line.split()])
+        return coeffs
+
+    try:
+        with open(path, "r") as f:
+            line_iter = iter(f.readlines())
+    except FileNotFoundError:
+        print(f"Warning: Potential file not found at {path}. SOC will be zero.")
+        return ecp_dict
+
+    for line in line_iter:
+        if not needed_elements: break
+        parts = line.strip().split()
+        if not parts or parts[0] not in needed_elements: continue
+        
+        sym, q = parts[0], elements_to_parse.get(parts[0])
+        if q is None or not any(f"q{q}" in p for p in parts): continue
+        
+        try:
+            next(line_iter); next(line_iter) # Skip header
+            n_soc_sets = int(next(line_iter).strip().split()[0])
+            for l in range(n_soc_sets):
+                proj_line = next(line_iter)
+                while not proj_line.strip() or proj_line.strip().startswith('#'):
+                    proj_line = next(line_iter)
+                proj_parts = proj_line.split()
+                r, nprj = float(proj_parts[0]), int(proj_parts[1])
+                n_coeffs = nprj * (nprj + 1) // 2
+                h = _collect_coeffs(line_iter, n_coeffs, proj_parts[2:])
+                k = _collect_coeffs(line_iter, n_coeffs, []) if l > 0 else []
+                ecp_dict[sym]['so'].append({'l': l, 'r': r, 'nprj': nprj, 'h_coeffs': h, 'k_coeffs': k})
+            needed_elements.remove(sym)
+        except Exception as e:
+            continue
+            
+    return ecp_dict
+
+

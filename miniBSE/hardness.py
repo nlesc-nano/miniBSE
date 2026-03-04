@@ -1,5 +1,4 @@
 import numpy as np
-import time
 from scipy.spatial.distance import pdist, squareform
 from scipy.spatial import ConvexHull, distance_matrix
 
@@ -27,8 +26,7 @@ HARDNESS_DICT = {
 }
 
 # Material database:
-# (eps_inf, Bohr_diameter_A, lattice_A, bulk_gap_eV,
-#  eps_static, m_eff (reduced), E_LO_eV)
+# (eps_bulk, Bohr_diameter_A, lattice_A, bulk_gap_eV, eps_static, m_eff (reduced), E_LO_eV)
 MATERIAL_DB = {
     # Halide Perovskites
     "CSPBCL3":  (4.0, 25.0, 5.60, 3.00, 20.0, 0.15, 0.022),
@@ -63,76 +61,36 @@ MATERIAL_DB = {
     "PBS":      (17.2, 200.0, 5.94, 0.41, 23.0, 0.09, 0.027),
     "PBSE":     (22.9, 460.0, 6.12, 0.27, 30.0, 0.07, 0.017),
 
-    "DEFAULT":  (1.0, 1.0, 5.0, 0.0, 1.0, 1.0, 0.02),
-
-    # Solvents (keep 4-tuple)
-    "VACUUM":          (1.0,  1.0, 1.0, 0.0),
-    "TOLUENE":         (2.38, 1.0, 1.0, 0.0),
-    "HEXANE":          (1.89, 1.0, 1.0, 0.0),
-    "HEXDECANE":       (2.05, 1.0, 1.0, 0.0),
-    "OCTADECENE":      (2.25, 1.0, 1.0, 0.0),
-    "CHLOROFORM":      (4.81, 1.0, 1.0, 0.0),
-    "DICHLOROMETHANE": (8.93, 1.0, 1.0, 0.0),
+    "DEFAULT":  (1.0, 1.0, 5.0, 0.0, 1.0, 1.0, 0.02)
 }
 
 # Core inorganic elements for each material (ignores organic ligands like MA/FA)
 MATERIAL_ELEMENTS = {
-    "CSPBCL3": ["Cs", "Pb", "Cl"],
-    "CSPBBR3": ["Cs", "Pb", "Br"],
-    "CSPBI3":  ["Cs", "Pb", "I"],
-    "MAPBI3":  ["Pb", "I"], 
-    "FAPBI3":  ["Pb", "I"], 
-    "ZNS":     ["Zn", "S"],
-    "ZNSE":    ["Zn", "Se"],
-    "ZNTE":    ["Zn", "Te"],
-    "CDS":     ["Cd", "S"],
-    "CDSE":    ["Cd", "Se"],
-    "CDTE":    ["Cd", "Te"],
-    "HGS":     ["Hg", "S"],
-    "HGSE":    ["Hg", "Se"],
-    "HGTE":    ["Hg", "Te"],
-    "ALP":     ["Al", "P"],
-    "ALAS":    ["Al", "As"],
-    "ALSB":    ["Al", "Sb"],
-    "GAP":     ["Ga", "P"],
-    "GAAS":    ["Ga", "As"],
-    "GASB":    ["Ga", "Sb"],
-    "INP":     ["In", "P"],
-    "INAS":    ["In", "As"],
-    "INSB":    ["In", "Sb"],
-    "PBS":     ["Pb", "S"],
-    "PBSE":    ["Pb", "Se"]
+    "CSPBCL3": ["Cs", "Pb", "Cl"], "CSPBBR3": ["Cs", "Pb", "Br"], "CSPBI3":  ["Cs", "Pb", "I"],
+    "MAPBI3":  ["Pb", "I"], "FAPBI3":  ["Pb", "I"], 
+    "ZNS":     ["Zn", "S"], "ZNSE":    ["Zn", "Se"], "ZNTE":    ["Zn", "Te"],
+    "CDS":     ["Cd", "S"], "CDSE":    ["Cd", "Se"], "CDTE":    ["Cd", "Te"],
+    "HGS":     ["Hg", "S"], "HGSE":    ["Hg", "Se"], "HGTE":    ["Hg", "Te"],
+    "ALP":     ["Al", "P"], "ALAS":    ["Al", "As"], "ALSB":    ["Al", "Sb"],
+    "GAP":     ["Ga", "P"], "GAAS":    ["Ga", "As"], "GASB":    ["Ga", "Sb"],
+    "INP":     ["In", "P"], "INAS":    ["In", "As"], "INSB":    ["In", "Sb"],
+    "PBS":     ["Pb", "S"], "PBSE":    ["Pb", "Se"]
 }
 
-def compute_polaron_dielectric(eps_inf, eps_static):
-    if eps_static <= eps_inf:
-        return eps_inf
-    return (eps_inf * eps_static / (eps_static - eps_inf)) * np.log(eps_static / eps_inf)
-
 def get_cluster_size_metrics(coords_ang, atom_symbols=None, material_name=None):
-    """Robust, rotation-invariant size metrics for nanoclusters/QDs (Angstrom).
-       Filters for inorganic core atoms if atom_symbols and material_name are provided.
-    """
+    """Robust, rotation-invariant size metrics for nanoclusters/QDs (Angstrom)."""
     coords = np.asarray(coords_ang, dtype=float)
 
-    # Filter out ligands if symbols and material are provided
     if atom_symbols is not None and material_name is not None:
         m_name = material_name.upper()
         if m_name in MATERIAL_ELEMENTS:
             core_elements = [el.lower() for el in MATERIAL_ELEMENTS[m_name]]
-            core_coords = [
-                coords[i] for i, sym in enumerate(atom_symbols) 
-                if sym.lower() in core_elements
-            ]
+            core_coords = [coords[i] for i, sym in enumerate(atom_symbols) if sym.lower() in core_elements]
             if len(core_coords) > 0:
                 coords = np.array(core_coords)
-                print(f"    [Geometry] Filtered core atoms: {len(coords)} / {len(coords_ang)} total atoms.")
-            else:
-                print(f"    [Geometry] WARNING: No core atoms matched for {m_name}. Using all atoms.")
 
     if len(coords) < 2:
-        return {'R_eff_hull': 1.0, 'diameter_hull': 2.0, 'volume_hull_ang3': 4.1888,
-                'Rg': 0.5, 'diameter_max': 0.0}
+        return {'R_eff_hull': 1.0, 'diameter_hull': 2.0}
 
     com = np.mean(coords, axis=0)
     r_vec = coords - com
@@ -141,45 +99,20 @@ def get_cluster_size_metrics(coords_ang, atom_symbols=None, material_name=None):
 
     try:
         hull = ConvexHull(coords, qhull_options='QJ')
-        vol_ang3 = hull.volume
-        R_eff_hull = (3.0 * vol_ang3 / (4.0 * np.pi)) ** (1.0 / 3.0)
-        diameter_hull = 2.0 * R_eff_hull
+        R_eff_hull = (3.0 * hull.volume / (4.0 * np.pi)) ** (1.0 / 3.0)
     except Exception:
-        vol_ang3 = 0.0
         R_eff_hull = R_eff_gyr
-        diameter_hull = 2.0 * R_eff_gyr
 
-    diameter_max = np.max(distance_matrix(coords, coords)) if len(coords) > 1 else 0.0
+    return {'R_eff_hull': R_eff_hull, 'diameter_hull': 2.0 * R_eff_hull}
 
-    return {
-        'Rg': Rg,
-        'R_eff_gyr': R_eff_gyr,
-        'R_eff_hull': R_eff_hull,
-        'volume_hull_ang3': vol_ang3,
-        'diameter_hull': diameter_hull,
-        'diameter_max': diameter_max
-    }
-
-def get_auto_alpha(coords, material_name=None, eps_bulk=None, L_scale=None):
-    dmin = np.min(coords, axis=0)
-    dmax = np.max(coords, axis=0)
-    diameter = np.linalg.norm(dmax - dmin)
-    R_eff = diameter / 2.0
-
-    m_name = material_name.upper() if material_name else "DEFAULT"
-    db_eps, db_bohr, db_alat, db_gap = MATERIAL_DB.get(m_name, MATERIAL_DB["DEFAULT"])
-    final_eps = eps_bulk if eps_bulk is not None else db_eps
-
-    if final_eps > 1.0:
-        L_diel = db_alat / (2.0 * np.sqrt(final_eps - 1.0))
-    else:
-        L_diel = 5.0
-
-    alpha_inf = 1.0 / final_eps
-    alpha = alpha_inf + (1.0 - alpha_inf) * np.exp(-R_eff / L_diel)
-    return alpha, diameter, final_eps, L_diel
-
+# =====================================================================
+# Model 1: Classic MNOK Kernel (sTDA style)
+# =====================================================================
 def build_gamma(atom_symbols, coords, alpha, eta_dict=HARDNESS_DICT):
+    """
+    Standard Ohno-Klopman kernel. 
+    `alpha` is used literally as the multiplicative prefactor (e.g., alpha=0.5).
+    """
     BOHR_TO_ANG = 0.52917721
     HA_TO_EV = 27.211386
     coords_au = coords / BOHR_TO_ANG
@@ -187,277 +120,73 @@ def build_gamma(atom_symbols, coords, alpha, eta_dict=HARDNESS_DICT):
     etas_au = np.array([eta_dict[s.lower()] for s in atom_symbols]) / HA_TO_EV
     a_au = 1.0 / etas_au
     damp_mat_au = 0.5 * (a_au[:, np.newaxis] + a_au[np.newaxis, :])
+    
     gamma_au = 1.0 / np.sqrt(r_mat_au**2 + damp_mat_au**2)
     return alpha * gamma_au * HA_TO_EV
 
-def compute_polaron_radius_nm(m_eff, E_LO_eV):
-    if m_eff <= 0 or E_LO_eV <= 0:
-        return 0.0
-    return 0.53 / np.sqrt(m_eff) * np.sqrt(1.0 / E_LO_eV)
-
 # =====================================================================
-# NEW: Universal Tunable Resta-MNOK Kernel (Spatial Dispersion)
+# Model 2: Universal Tunable Resta-MNOK Kernel (Spatial Dispersion)
 # =====================================================================
 def build_resta_mnok(atom_symbols, coords, alpha, material_name, eps_out=2.0, eta_dict=HARDNESS_DICT):
-    """
-    Computes the Resta-MNOK kernel with spatial dispersion.
-    
-    - alpha: Universal dimensionless tuning parameter for dielectric confinement.
-    - material_name: Used to fetch bulk dielectric and filter core atoms for bond lengths.
-    - eps_out: Dielectric constant of the surrounding medium (e.g., ~2.0 for ligands/solvents).
-    """
     BOHR_TO_ANG = 0.52917721
     HA_TO_EV = 27.211386
     
-    # 1. Geometry: Get R_QD and isolate core atoms for d_NN calculation
+    # 1. Geometry and Size Metrics
     metrics = get_cluster_size_metrics(coords, atom_symbols, material_name)
     R_QD_ang = metrics['R_eff_hull']
     
-    # Dynamically find the characteristic nearest-neighbor bond length (d_NN)
     m_name = material_name.upper() if material_name else "DEFAULT"
+    entry = MATERIAL_DB.get(m_name, MATERIAL_DB["DEFAULT"])
+    
+    # --- FETCH BOTH CONSTANTS ---
+    eps_inf_bulk = entry[0]    # Index 0: High-frequency (electronic)
+    eps_0_bulk = entry[4]      # Index 4: Static (ionic + electronic)
+    a_B_ang = entry[1] / 2.0 if entry[1] > 0 else 10.0
+    
+    # 2. Geometry for screening length
     core_coords = coords
     if m_name in MATERIAL_ELEMENTS:
         core_elements = [el.lower() for el in MATERIAL_ELEMENTS[m_name]]
         core_coords = np.array([coords[i] for i, sym in enumerate(atom_symbols) if sym.lower() in core_elements])
     
     if len(core_coords) > 1:
-        # Distance matrix of core atoms, fill diagonal with infinity to ignore self-distance
         r_core_ang = squareform(pdist(core_coords))
         np.fill_diagonal(r_core_ang, np.inf)
         d_NN_ang = np.median(np.min(r_core_ang, axis=1))
     else:
-        d_NN_ang = 2.5 # Safe fallback
-        
-    # 2. Material Data
-    entry = MATERIAL_DB.get(m_name, MATERIAL_DB["DEFAULT"])
-    eps_bulk = entry[0]
-    a_B_ang = entry[1] / 2.0 if entry[1] > 0 else 10.0 # Exciton Bohr radius
-    
-    # 3. Size-Dependent Effective Dielectric Constant
+        d_NN_ang = 2.5 
+
+    # 3. Size-Dependent Effective Dielectric Constants
     confinement_ratio = R_QD_ang / a_B_ang
-    eps_eff = eps_out + (eps_bulk - eps_out) * (1.0 - np.exp(-alpha * confinement_ratio))
     
-    # 4. Tie screening length (k_s) to bulk dielectric and bond length
+    # Size-tune both limits
+    eps_eff_inf = eps_out + (eps_inf_bulk - eps_out) * (1.0 - np.exp(-alpha * confinement_ratio))
+    eps_eff_0   = eps_out + (eps_0_bulk - eps_out)   * (1.0 - np.exp(-alpha * confinement_ratio))
+    
+    # 4. Tie screening length (k_s) to the electronic bulk limit
     d_NN_au = d_NN_ang / BOHR_TO_ANG
-    k_s_au = np.sqrt(max(0.0, eps_bulk - 1.0)) / d_NN_au
+    k_s_au = np.sqrt(max(0.0, eps_inf_bulk - 1.0)) / d_NN_au
     
-    print("\n    [Kernel: Tunable Resta-MNOK]")
+    print("\n    [Kernel: Dual-Screening Resta-MNOK]")
     print(f"    Material            = {m_name}")
     print(f"    R_QD (hull_eff)     = {R_QD_ang:.3f} Å")
-    print(f"    Characteristic Bond = {d_NN_ang:.3f} Å (d_NN)")
-    print(f"    Confinement Ratio   = {confinement_ratio:.3f} (R_QD / a_B)")
-    print(f"    α (tuning param)    = {alpha:.3f}")
-    print(f"    ε_out (environment) = {eps_out:.3f}")
-    print(f"    ε_bulk (database)   = {eps_bulk:.3f}")
-    print(f"    ε_eff  (computed)   = {eps_eff:.3f}")
+    print(f"    ε_eff (Electronic)  = {eps_eff_inf:.3f} (Limit: {eps_inf_bulk})")
+    print(f"    ε_eff (Static/Extra)= {eps_eff_0:.3f} (Limit: {eps_0_bulk})")
     print(f"    Inverse Screening   = {k_s_au:.4f} a.u.^-1 (k_s)\n")
     
     # 5. Build Matrices
     coords_au = coords / BOHR_TO_ANG
     r_mat_au = squareform(pdist(coords_au))
-    
     etas_au = np.array([eta_dict[s.lower()] for s in atom_symbols]) / HA_TO_EV
     a_au = 1.0 / etas_au
     damp_mat_au = 0.5 * (a_au[:, np.newaxis] + a_au[np.newaxis, :])
-    
-    # 6. The Screened Resta-MNOK Math
     mnok_denom_au = np.sqrt(r_mat_au**2 + damp_mat_au**2)
-    c_screen = 1.0 / eps_eff
     
-    # Formula: (1/eps_eff + (1 - 1/eps_eff) * exp(-k_s * R)) / sqrt(R^2 + a^2)
-    gamma_au = (c_screen + (1.0 - c_screen) * np.exp(-k_s_au * r_mat_au)) / mnok_denom_au
+    # 6. Apply Dual-Screening Math
+    c_static = 1.0 / eps_eff_0
+    
+    # Standard Resta form now utilizes the static limit for long-range screening
+    gamma_au = (c_static + (1.0 - c_static) * np.exp(-k_s_au * r_mat_au)) / mnok_denom_au
     
     return gamma_au * HA_TO_EV
-
-
-def compute_sos_polarizability(mu_ia_x, mu_ia_y, mu_ia_z, delta_e_ia_ev):
-    delta_e_au = delta_e_ia_ev / 27.211386
-    ax = 2.0 * np.sum((mu_ia_x ** 2) / delta_e_au)
-    ay = 2.0 * np.sum((mu_ia_y ** 2) / delta_e_au)
-    az = 2.0 * np.sum((mu_ia_z ** 2) / delta_e_au)
-    return (ax + ay + az) / 3.0
-
-def eps_from_clausius_mossotti(alpha_au3, vol_ang3):
-    if vol_ang3 <= 0:
-        return 1.01
-    bohr3_to_ang3 = (0.52917721) ** 3
-    alpha_vol_ang3 = alpha_au3 * bohr3_to_ang3
-    f = (4.0 * np.pi / 3.0) * (alpha_vol_ang3 / vol_ang3)
-    if f >= 1.0:
-        f = 0.999
-    eps = (1.0 + 2.0 * f) / (1.0 - f)
-    return max(eps, 1.01)
-
-def compute_alpha_polariz_screening(coords_ang, mu_ia_x, mu_ia_y, mu_ia_z,
-                                    delta_e_ia_ev, atom_symbols=None, material_name=None,
-                                    eps_bulk=None, n_transitions=None):
-    metrics = get_cluster_size_metrics(coords_ang, atom_symbols, material_name)
-    vol = metrics['volume_hull_ang3']
-    if vol <= 0:
-        vol = (4.0 * np.pi / 3.0) * metrics['R_eff_hull'] ** 3
-
-    alpha_iso = compute_sos_polarizability(mu_ia_x, mu_ia_y, mu_ia_z, delta_e_ia_ev)
-    eps_target = eps_from_clausius_mossotti(alpha_iso, vol)
-
-    if eps_bulk is not None and eps_bulk > eps_target:
-        eps_target = 0.7 * eps_target + 0.3 * eps_bulk   
-
-    alpha = 1.0 / eps_target
-
-    print(f"    [Screening-Polariz] α_iso = {alpha_iso:.2f} bohr³ | V_hull = {vol:.1f} Å³")
-    print(f"    [Screening-Polariz] R_eff = {metrics['R_eff_hull']:.2f} Å | ε_eff = {eps_target:.3f} | α = {alpha:.4f}")
-
-    if n_transitions is not None and n_transitions < 2000:
-        print("    [WARNING] Active-space truncated SOS polarizability detected (n_occ×n_virt < 2000).")
-        print("              Results are approximate; consider larger --n-occ/--n-virt or --e_thresh.")
-    return alpha, metrics['diameter_hull'], eps_target, alpha_iso, 0.0
-
-def compute_sos_screening(eps, homo_index, n_occ, n_virt, mu_ia_x, mu_ia_y, mu_ia_z,
-                          coords, atom_symbols=None, material_name=None, eps_bulk=None,
-                          screening_mode="auto", manual_alpha=None):
-    
-    if manual_alpha is not None:
-        metrics = get_cluster_size_metrics(coords, atom_symbols, material_name)
-        m_name = material_name.upper() if material_name else "DEFAULT"
-        entry = MATERIAL_DB.get(m_name, MATERIAL_DB["DEFAULT"])
-        
-        db_eps = entry[0]
-        db_gap = entry[3]
-        final_eps_bulk = eps_bulk if eps_bulk is not None else db_eps
-        eps_eff = 1.0 / manual_alpha if manual_alpha != 0 else float('inf')
-        
-        print("    [Screening] MANUAL OVERRIDE active. Computation shut off.")
-        print(f"    [Screening-Manual] α = {manual_alpha:.4f} | ε_eff = {eps_eff:.3f}")
-        
-        return manual_alpha, metrics['diameter_hull'], eps_eff, 0.0, db_gap, final_eps_bulk
-
-    n_trans = n_occ * n_virt
-    occ_e = eps[homo_index - n_occ + 1 : homo_index + 1]
-    virt_e = eps[homo_index + 1 : homo_index + 1 + n_virt]
-    delta_e_ia_ev = virt_e[None, :] - occ_e[:, None]
-
-    print(f"    [Screening] Mode = {screening_mode.upper()} | Active transitions = {n_trans}")
-
-    if screening_mode.upper() == "GEOMETRIC" or (screening_mode.upper() == "AUTO" and n_trans < 2000):
-        metrics = get_cluster_size_metrics(coords, atom_symbols, material_name)
-        R_eff = metrics['R_eff_hull']
-        diameter = metrics['diameter_hull']
-
-        m_name = material_name.upper() if material_name else "DEFAULT"
-        entry = MATERIAL_DB.get(m_name, MATERIAL_DB["DEFAULT"])
-        db_eps, _, db_alat, db_gap = entry[:4]          
-
-        final_eps_bulk = eps_bulk if eps_bulk is not None else db_eps
-        L_scale = db_alat * 1.5 if db_alat > 0 else 10.0
-        ratio = R_eff / L_scale if L_scale > 0 else 0.0
-
-        interp_factor = 1.0 - np.exp(-R_eff / L_scale)
-        eps_eff = 1.0 + (final_eps_bulk - 1.0) * interp_factor
-        alpha = 1.0 / eps_eff
-
-        print(f"    [Screening-Geometric] R_eff          = {R_eff:6.2f} Å")
-        print(f"    [Screening-Geometric] L_scale        = {L_scale:6.2f} Å")
-        print(f"    [Screening-Geometric] R_eff / L_scale = {ratio:6.2f}")
-        print(f"    [Screening-Geometric] ε_bulk         = {final_eps_bulk:6.2f}")
-        print(f"    [Screening-Geometric] ε_eff          = {eps_eff:6.3f} | α = {alpha:.4f}")
-
-        return alpha, diameter, eps_eff, 0.0, db_gap, final_eps_bulk
-
-    elif screening_mode in ("polariz", "hybrid"):
-        alpha_p, diam, eps_p, alpha_iso, _ = compute_alpha_polariz_screening(
-            coords, mu_ia_x, mu_ia_y, mu_ia_z, delta_e_ia_ev,
-            atom_symbols, material_name, eps_bulk, n_trans)
-
-        if screening_mode == "hybrid":
-            alpha_g, _, eps_g, _, _ = compute_sos_screening(eps, homo_index, n_occ, n_virt,
-                                                            mu_ia_x, mu_ia_y, mu_ia_z, coords,
-                                                            atom_symbols, material_name, eps_bulk, "geometric")
-            alpha = 0.5 * (alpha_p + alpha_g)
-            eps_target = 1.0 / alpha
-            print(f"    [Screening-Hybrid] Final α = {alpha:.4f} (blended)")
-        else:
-            alpha = alpha_p
-            eps_target = eps_p
-
-        return alpha, diam, eps_target, alpha_iso, 0.0
-
-    elif screening_mode.lower() in ["dielectric_conf", "dielectric_confinement"]:
-        m_name = material_name.upper() if material_name else "DEFAULT"
-        entry = MATERIAL_DB.get(m_name, MATERIAL_DB["DEFAULT"])
-        db_eps, _, _, db_gap = entry[:4]
-    
-        final_eps_bulk = eps_bulk if eps_bulk is not None else db_eps
-    
-        alpha, diam, eps_eff, _ = compute_alpha_dielectric_confinement(
-            coords,
-            atom_symbols=atom_symbols,
-            material_name=material_name,
-            eps_bulk=eps_bulk,
-            eps_out="VACUUM"
-        )
-    
-        return alpha, diam, eps_eff, 0.0, db_gap, final_eps_bulk
-
-    else:
-        raise ValueError(f"Unknown screening_mode '{screening_mode}'")
-
-def compute_alpha_dielectric_confinement(coords_ang,
-                                         atom_symbols=None,
-                                         material_name=None,
-                                         eps_bulk=None,
-                                         eps_out=1.0):
-    metrics = get_cluster_size_metrics(coords_ang, atom_symbols, material_name)
-    R_eff = metrics['R_eff_hull']       
-    R_eff_nm = R_eff / 10.0            
-
-    m_name = material_name.upper() if material_name else "DEFAULT"
-    entry = MATERIAL_DB.get(m_name, MATERIAL_DB["DEFAULT"])
-
-    if len(entry) >= 7:
-        eps_inf, db_bohr, db_alat, db_gap, eps_static, m_eff, E_LO = entry
-    else:
-        eps_inf, db_bohr, db_alat, db_gap = entry[:4]
-        eps_static = eps_inf
-        m_eff = 1.0
-        E_LO = 0.02
-
-    eps_inf_final = eps_bulk if eps_bulk is not None else eps_inf
-
-    if isinstance(eps_out, str):
-        eps_out_name = eps_out.upper()
-        eps_out = MATERIAL_DB.get(eps_out_name, MATERIAL_DB["VACUUM"])[0]
-
-    if eps_static > eps_inf_final:
-        eps_pol = (eps_inf_final * eps_static / (eps_static - eps_inf_final)) * \
-                  np.log(eps_static / eps_inf_final)
-    else:
-        eps_pol = eps_inf_final
-
-    if m_eff > 0 and E_LO > 0:
-        Rp_nm = 0.53 / np.sqrt(m_eff) * np.sqrt(1.0 / E_LO)
-    else:
-        Rp_nm = 0.0
-
-    aB_nm = db_bohr / 20.0 if db_bohr > 0 else 1.0
-    nonlocal_factor = (R_eff_nm**2) / (R_eff_nm**2 + aB_nm**2)
-    eps_in = eps_inf_final + (eps_pol - eps_inf_final) * nonlocal_factor
-    eps_eff = 0.5 * (eps_in + eps_out)
-    alpha = 1.0 / eps_eff if eps_eff > 0 else 1.0
-
-    print("\n    [Screening-Dielectric-Confinement-Polaron]")
-    print(f"    R_eff (hull)        = {R_eff_nm:6.3f} nm")
-    print(f"    a_B (exciton)       = {aB_nm:6.3f} nm")
-    print(f"    nonlocal factor     = {nonlocal_factor:6.3f}")
-    print(f"    ε_inf               = {eps_inf_final:6.3f}")
-    print(f"    ε_static            = {eps_static:6.3f}")
-    print(f"    ε_pol               = {eps_pol:6.3f}")
-    print(f"    m_eff               = {m_eff:6.3f}")
-    print(f"    E_LO (eV)           = {E_LO:6.4f}")
-    print(f"    Rp (bulk)           = {Rp_nm:6.3f} nm")
-    print(f"    ε_out               = {eps_out:6.3f}")
-    print(f"    ε_in(R)             = {eps_in:6.3f}")
-    print(f"    ε_eff               = {eps_eff:6.3f}")
-    print(f"    α (1/ε_eff)         = {alpha:6.4f}\n")
-
-    return alpha, metrics['diameter_hull'], eps_eff, 0.0
 
