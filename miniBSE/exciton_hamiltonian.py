@@ -10,7 +10,9 @@ class ExcitonHamiltonian:
         self.include_exchange = include_exchange
         self.gamma = gamma
         self.soc_flag = (soc_U is not None and soc_E is not None)
-
+        self.overlap = overlap                # <-- ADD THIS LINE
+        self.atom_ao_ranges = atom_ao_ranges  # <-- ADD THIS LINE
+        
         occ_idx = np.arange(homo_index - n_occ + 1, homo_index + 1)
         virt_idx = np.arange(homo_index + 1, homo_index + 1 + n_virt)
         n_occ_act, n_virt_act = len(occ_idx), len(virt_idx)
@@ -146,106 +148,98 @@ class ExcitonHamiltonian:
         if self.soc_flag:
             self.build_spinor_basis(soc_U, soc_E, e_thresh)
 
-
     def build_spinor_basis(self, U_mo, soc_E, e_thresh):
         print("\n--- [SOC] Transforming Exciton Hamiltonian to Spinor Basis ---")
         k = self.n_occ_act + self.n_virt_act
         self.n_occ_spinor = 2 * self.n_occ_act
         self.n_virt_spinor = 2 * self.n_virt_act
-        
-        # New active space dimension (Full Spinor Space, no thresholds applied here)
         self.dim_spinor = self.n_occ_spinor * self.n_virt_spinor
-        self.dim = self.dim_spinor  # Update dimension for the Davidson Solver
+        self.dim = self.dim_spinor
+        self.soc_U = U_mo # Save for dipole mapping
 
         print(f"\n  Retained Active Space Spinors:")
         print(f"    {'Spinor':>12} | {'Index':>6} | {'Energy (eV)':>12} | {'Occ':>5}")
         print(f"    {'-'*46}")
-        
-        # Virtual Spinors (print top-down to LUMO)
         for idx in range(self.n_occ_spinor + self.n_virt_spinor - 1, self.n_occ_spinor - 1, -1):
-            rel_idx = idx - self.n_occ_spinor
-            label = "spL" if rel_idx == 0 else f"spL+{rel_idx}"
+            label = "spL" if idx - self.n_occ_spinor == 0 else f"spL+{idx - self.n_occ_spinor}"
             print(f"    {label:>12} | {idx + 1:6d} | {soc_E[idx]:12.4f} | {0.0:5.1f}")
-            
         print(f"    {'-- FERMI --':>12} | {'------':>6} | {'------------':>12} | {'-----':>5}")
-        
-        # Occupied Spinors (print HOMO down to bottom)
         for idx in range(self.n_occ_spinor - 1, -1, -1):
-            rel_idx = (self.n_occ_spinor - 1) - idx
-            label = "spH" if rel_idx == 0 else f"spH-{rel_idx}"
-            # Spinors hold 1 electron each, so occ is 1.0
+            label = "spH" if (self.n_occ_spinor - 1) - idx == 0 else f"spH-{(self.n_occ_spinor - 1) - idx}"
             print(f"    {label:>12} | {idx + 1:6d} | {soc_E[idx]:12.4f} | {1.0:5.1f}")
         print("\n")
         
-        # 1. Extract Alpha/Beta Blocks from Single-Particle Spinor Transformation
+        # 1. Extract Alpha/Beta Blocks (Truncated to Occ/Virt spaces as per original formalism)
         U_occ_a = U_mo[0 : self.n_occ_act, 0 : self.n_occ_spinor]
         U_virt_a = U_mo[self.n_occ_act : k, self.n_occ_spinor : 2*k]
-        
         U_occ_b = U_mo[k : k + self.n_occ_act, 0 : self.n_occ_spinor]
         U_virt_b = U_mo[k + self.n_occ_act : 2*k, self.n_occ_spinor : 2*k]
-        # 2. Build Spin-Integrated Density Overlap D_{ia}^{IA}
-        # Mapping: spatial transition (i,a) -> spinor transition (I,A)
-        print("  -> Computing transition density spinor mapping (Fast Broadcast)...")
+
+        print("  -> Constructing Spinor AOs natively for fast integrals...")
+        t_sp = time.time()
         
-        # Broadcasting is exponentially faster than unoptimized einsum for outer products
-        D_a = U_occ_a.conj()[:, None, :, None] * U_virt_a[None, :, None, :]
-        D_b = U_occ_b.conj()[:, None, :, None] * U_virt_b[None, :, None, :]
-        D_tensor = D_a + D_b
+        # Convert spatial MOs to Spinor MOs natively
+        C_o = self.C_orig_occ
+        C_v = self.C_orig_virt
         
-        # Reshape to (Spatial_Transitions, Spinor_Transitions)
-        self.D_matrix = D_tensor.reshape(self.n_occ_act * self.n_virt_act, self.dim_spinor)        
- 
-        # 3. Restore truncated spatial q_flat to full (n_occ * n_virt) size
-        q_spatial_full = np.zeros((self.n_occ_act * self.n_virt_act, self.n_atoms))
-        flat_valid_indices = self.valid_i * self.n_virt_act + self.valid_a
-        q_spatial_full[flat_valid_indices, :] = self.q_flat
+        C_sp_occ_a = C_o @ U_occ_a
+        C_sp_occ_b = C_o @ U_occ_b
+        C_sp_virt_a = C_v @ U_virt_a
+        C_sp_virt_b = C_v @ U_virt_b
         
-        # 4. Map Transition Charges: q^{IA}_C = \sum_{ia} D_{ia}^{IA} q^{ia}_C
-        self.q_spinor = self.D_matrix.T @ q_spatial_full
-       
-        # 5. Transform Exchange Blocks
+        overlap_dense = self.overlap.toarray() if hasattr(self.overlap, 'toarray') else self.overlap
+        SC_sp_occ_a = overlap_dense @ C_sp_occ_a
+        SC_sp_occ_b = overlap_dense @ C_sp_occ_b
+        SC_sp_virt_a = overlap_dense @ C_sp_virt_a
+        SC_sp_virt_b = overlap_dense @ C_sp_virt_b
+        
+        self.q_spinor = np.zeros((self.dim_spinor, self.n_atoms), dtype=complex)
         if self.include_exchange:
-            print("  -> Computing exchange density spinor mapping natively (O(N^3) Memory-Free)...")
+            self.q_hole_spinor = np.zeros((self.n_occ_spinor, self.n_occ_spinor, self.n_atoms), dtype=complex)
+            self.q_elec_spinor = np.zeros((self.n_virt_spinor, self.n_virt_spinor, self.n_atoms), dtype=complex)
+
+        print(f"  -> Assembling transition density blocks (Atom-by-Atom via BLAS)...")
+        for A, (a0, a1) in enumerate(self.atom_ao_ranges):
+            Co_a = C_sp_occ_a[a0:a1, :]
+            SCo_a = SC_sp_occ_a[a0:a1, :]
+            Cv_a = C_sp_virt_a[a0:a1, :]
+            SCv_a = SC_sp_virt_a[a0:a1, :]
             
-            # BYPASS building the massive 4D D_hole tensor!
-            # We contract the spatial (i,j) axes directly into the spinor space.
+            Co_b = C_sp_occ_b[a0:a1, :]
+            SCo_b = SC_sp_occ_b[a0:a1, :]
+            Cv_b = C_sp_virt_b[a0:a1, :]
+            SCv_b = SC_sp_virt_b[a0:a1, :]
             
-            # Hole overlap mapping
-            qh_a = np.einsum('iI, ijC, jJ -> IJC', U_occ_a.conj(), self.q_occ, U_occ_a, optimize=True)
-            qh_b = np.einsum('iI, ijC, jJ -> IJC', U_occ_b.conj(), self.q_occ, U_occ_b, optimize=True)
-            self.q_hole_spinor = qh_a + qh_b
+            # Ultra-Fast Native Spinor Projection
+            q_A_alpha = 0.5 * (Co_a.conj().T @ SCv_a + SCo_a.conj().T @ Cv_a)
+            q_A_beta  = 0.5 * (Co_b.conj().T @ SCv_b + SCo_b.conj().T @ Cv_b)
             
-            # Electron overlap mapping
-            qe_a = np.einsum('aA, abC, bB -> ABC', U_virt_a.conj(), self.q_virt, U_virt_a, optimize=True)
-            qe_b = np.einsum('aA, abC, bB -> ABC', U_virt_b.conj(), self.q_virt, U_virt_b, optimize=True)
-            self.q_elec_spinor = qe_a + qe_b
- 
-        # 6. Spinor Zero-Order Energies
+            self.q_spinor[:, A] = (q_A_alpha + q_A_beta).flatten()
+            
+            if self.include_exchange:
+                self.q_hole_spinor[:, :, A] = 0.5 * (Co_a.conj().T @ SCo_a + SCo_a.conj().T @ Co_a + Co_b.conj().T @ SCo_b + SCo_b.conj().T @ Co_b)
+                self.q_elec_spinor[:, :, A] = 0.5 * (Cv_a.conj().T @ SCv_a + SCv_a.conj().T @ Cv_a + Cv_b.conj().T @ SCv_b + SCv_b.conj().T @ Cv_b)
+
+        print(f"  -> Density mappings compiled natively in {time.time() - t_sp:.2f}s")
+
+        # 3. Spinor Zero-Order Energies
         eps_occ_sp = soc_E[0 : self.n_occ_spinor]
         eps_virt_sp = soc_E[self.n_occ_spinor : 2*k]
-        diff_sp = eps_virt_sp.reshape(1, -1) - eps_occ_sp.reshape(-1, 1)
-        
-        raw_gap_spinor = diff_sp.flatten()
+        raw_gap_spinor = (eps_virt_sp.reshape(1, -1) - eps_occ_sp.reshape(-1, 1)).flatten()
         raw_D_spinor = raw_gap_spinor + self.scissor_ev
         
-        # --- FIXED TRUNCATION LOGIC ---
-        # Apply e_thresh to the RAW gap (just like the spatial code does)
         if e_thresh is not None:
             self.valid_spinor_mask = raw_gap_spinor <= e_thresh
         else:
             self.valid_spinor_mask = np.ones_like(raw_D_spinor, dtype=bool)
             
         self.valid_spinor_idx = np.where(self.valid_spinor_mask)[0]
-            
-        # Apply the mask globally so downstream tools don't crash
         self.D_spinor = raw_D_spinor[self.valid_spinor_mask]
         self.q_spinor = self.q_spinor[self.valid_spinor_mask, :]
-        self.D_matrix = self.D_matrix[:, self.valid_spinor_mask]  # MUST slice D_matrix!
         self.D = self.D_spinor
         
         self.dim_spinor_full = len(raw_D_spinor)
         self.dim = len(self.D_spinor)
-        
         print(f"  -> BSE Active Space expanded to {self.dim_spinor_full} spinor transitions.")
         print(f"  -> Truncated Spinor Space (Energy <= {e_thresh} eV): {self.dim} valid transitions")
 
@@ -301,15 +295,19 @@ class ExcitonHamiltonian:
         """Extracts transition dipoles in either the spatial or spinor basis."""
         if not self.soc_flag:
             mu_ia = np.zeros((len(self.valid_i), 3))
-            mu_ia[:, 0] = mu_ia_x[self.valid_i, self.valid_a]
-            mu_ia[:, 1] = mu_ia_y[self.valid_i, self.valid_a]
-            mu_ia[:, 2] = mu_ia_z[self.valid_i, self.valid_a]
+            mu_ia[:, 0], mu_ia[:, 1], mu_ia[:, 2] = mu_ia_x[self.valid_i, self.valid_a], mu_ia_y[self.valid_i, self.valid_a], mu_ia_z[self.valid_i, self.valid_a]
             return mu_ia
             
-        # Map full spatial dipoles to full spinor dipoles
-        # mu_{IA} = \sum_{ia} D_{ia}^{IA} \mu_{ia}
-        mu_x_sp = self.D_matrix.T @ mu_ia_x.flatten()
-        mu_y_sp = self.D_matrix.T @ mu_ia_y.flatten()
-        mu_z_sp = self.D_matrix.T @ mu_ia_z.flatten()
-        return np.column_stack((mu_x_sp, mu_y_sp, mu_z_sp))
+        # Fast memory-free mapping for dipoles using U directly via matrix multiplication
+        k = self.n_occ_act + self.n_virt_act
+        U_occ_a = self.soc_U[0 : self.n_occ_act, 0 : self.n_occ_spinor]
+        U_virt_a = self.soc_U[self.n_occ_act : k, self.n_occ_spinor : 2*k]
+        U_occ_b = self.soc_U[k : k + self.n_occ_act, 0 : self.n_occ_spinor]
+        U_virt_b = self.soc_U[k + self.n_occ_act : 2*k, self.n_occ_spinor : 2*k]
+        
+        def map_dipole(mu_spatial):
+            mu_sp = U_occ_a.conj().T @ mu_spatial @ U_virt_a + U_occ_b.conj().T @ mu_spatial @ U_virt_b
+            return mu_sp.flatten()[self.valid_spinor_mask] if hasattr(self, 'valid_spinor_mask') else mu_sp.flatten()
+
+        return np.column_stack((map_dipole(mu_ia_x), map_dipole(mu_ia_y), map_dipole(mu_ia_z)))
 

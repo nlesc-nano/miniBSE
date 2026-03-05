@@ -25,6 +25,7 @@ find_package(Libint2 REQUIRED)
 pybind11_add_module(libint_cpp
     bindings.cpp
     integrals_core.cpp
+    basis_to_k.cpp
     cp2k_parser.cpp
 )
 

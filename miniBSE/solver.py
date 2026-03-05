@@ -70,29 +70,27 @@ class ExcitonSolver:
                     c_x = getattr(self.ham, 'c_x', 1.0) 
                     
                     vi, va = self.ham.valid_i, self.ham.valid_a
-                    n_occ_act = self.ham.q_occ.shape[0]
-                    n_virt_act = self.ham.q_virt.shape[0]
+                    n_p = len(vi)
                     
-                    print("    -> Contracting W = Gamma @ q_virt ...")
-                    t_w = time.time()
-                    W = np.tensordot(self.ham.gamma, self.ham.q_virt, axes=([1], [2])) 
-                    W = np.transpose(W, (1, 2, 0))
-                    print(f"    -> W contracted in {time.time()-t_w:.2f}s")
-                    
-                    print("    -> Contracting K_full in MO basis (Speed & Memory Optimized)...")
+                    print("    -> Constructing K_truncated natively (Zero-Memory Overhead)...")
                     t_k = time.time()
-                    K_full = np.tensordot(self.ham.q_occ, W, axes=([2], [2]))
-                    K_full_trans = np.transpose(K_full, (0, 2, 1, 3))
-                    K_2d = K_full_trans.reshape(n_occ_act * n_virt_act, n_occ_act * n_virt_act)
                     
-                    comp_idx = vi * n_virt_act + va
-                    K_truncated = K_2d[comp_idx[:, None], comp_idx[None, :]]
-                    print(f"    -> K_full and truncation completed in {time.time()-t_k:.2f}s")
+                    # 1. Slice natively 
+                    q_occ_sub = self.ham.q_occ[vi[:, None], vi[None, :], :]
+                    q_virt_sub = self.ham.q_virt[va[:, None], va[None, :], :]
+                    
+                    # 2. Contract Gamma only for the valid pairs
+                    W_sub = (q_virt_sub.reshape(n_p * n_p, -1) @ self.ham.gamma).reshape(n_p, n_p, -1)
+                    
+                    # 3. Element-wise multiply and sum
+                    K_truncated = np.sum(q_occ_sub * W_sub, axis=-1)
+                    
+                    print(f"    -> K_truncated assembled in {time.time()-t_k:.2f}s")
                     
                     H -= c_x * K_truncated
                     self.K_mat = c_x * K_truncated
                     print(f"    -> Total Exchange (-K) built in {time.time()-t1:.2f}s")
-
+ 
             else:
                 # ==========================================================
                 # SPINOR DENSE BUILDER (Relativistic Spin-Orbit)
@@ -114,27 +112,44 @@ class ExcitonSolver:
                     n_occ_sp = self.ham.n_occ_spinor
                     n_virt_sp = self.ham.n_virt_spinor
                     
-                    print("    -> Contracting W = Gamma @ q_elec_spinor ...")
-                    t_w = time.time()
-                    W = np.tensordot(self.ham.gamma, self.ham.q_elec_spinor, axes=([1], [2])) 
-                    W = np.transpose(W, (1, 2, 0))
-                    print(f"    -> W contracted in {time.time()-t_w:.2f}s")
-                    
-                    print("    -> Contracting K_full in Spinor basis...")
-                    t_k = time.time()
-                    K_full = np.tensordot(self.ham.q_hole_spinor.conj(), W, axes=([2], [2]))
-                    K_full_trans = np.transpose(K_full, (0, 2, 1, 3))
-                    
-                    # Spinor basis does not truncate via valid_i/valid_a, so we take the full 2D reshaped matrix
-                    K_2d = K_full_trans.reshape(n_occ_sp * n_virt_sp, n_occ_sp * n_virt_sp)
-                    print(f"    -> K_full completed in {time.time()-t_k:.2f}s")
-
-                    # --- NEW SLICING LOGIC ---
-                    if hasattr(self.ham, 'valid_spinor_mask'):
-                        K_truncated = K_2d[self.ham.valid_spinor_mask][:, self.ham.valid_spinor_mask]
+                    if hasattr(self.ham, 'valid_spinor_idx'):
+                        v_idx = self.ham.valid_spinor_idx
+                        vi_sp = v_idx // n_virt_sp
+                        va_sp = v_idx % n_virt_sp
+                        n_p = len(v_idx)
+                        
+                        print("    -> Constructing K_truncated natively (Zero-Memory Overhead)...")
+                        t_k = time.time()
+                        
+                        # 1. Slice natively 
+                        q_hole_sub = self.ham.q_hole_spinor.conj()[vi_sp[:, None], vi_sp[None, :], :]
+                        q_elec_sub = self.ham.q_elec_spinor[va_sp[:, None], va_sp[None, :], :]
+                        
+                        # 2. Contract Gamma only for the valid pairs
+                        W_sub = (q_elec_sub.reshape(n_p * n_p, -1) @ self.ham.gamma).reshape(n_p, n_p, -1)
+                        
+                        # 3. Element-wise multiply and sum
+                        K_truncated = np.sum(q_hole_sub * W_sub, axis=-1)
+                        
+                        print(f"    -> K_truncated assembled in {time.time()-t_k:.2f}s")
+                        
                         H -= K_truncated
                         self.K_mat = K_truncated
                     else:
+                        # Fallback
+                        print("    -> Contracting W = Gamma @ q_elec_spinor ...")
+                        t_w = time.time()
+                        W = np.tensordot(self.ham.gamma, self.ham.q_elec_spinor, axes=([1], [2])) 
+                        W = np.transpose(W, (1, 2, 0))
+                        print(f"    -> W contracted in {time.time()-t_w:.2f}s")
+                        
+                        print("    -> Contracting K_full in Spinor basis...")
+                        t_k = time.time()
+                        K_full = np.tensordot(self.ham.q_hole_spinor.conj(), W, axes=([2], [2]))
+                        K_full_trans = np.transpose(K_full, (0, 2, 1, 3))
+                        K_2d = K_full_trans.reshape(n_occ_sp * n_virt_sp, n_occ_sp * n_virt_sp)
+                        print(f"    -> K_full completed in {time.time()-t_k:.2f}s")
+
                         H -= K_2d
                         self.K_mat = K_2d
  
