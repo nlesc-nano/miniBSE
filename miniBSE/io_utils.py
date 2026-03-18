@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import math
 import numpy as np
 import collections
 from scipy.sparse import issparse, csr_matrix
@@ -33,8 +34,87 @@ def read_xyz(path):
 # ============================================================
 # BASIS PARSER (CP2K MOLOPT)
 # ============================================================
+import collections
+import numpy as np
 
 def parse_basis(fname, wanted):
+    basis = collections.defaultdict(list)
+    
+    with open(fname) as f:
+        # Filter out comments and completely empty lines upfront
+        lines = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+        
+    it = iter(lines)
+    
+    for line in it:
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+            
+        elem = parts[0]
+        bnames = parts[1:]
+        
+        # THE FIX: Allow partial matching so "DZVP" matches "DZVP-q13"
+        match_found = any(b.startswith(wanted) for b in bnames)
+        
+        if not match_found:
+            # Safely skip this block
+            try:
+                nset = int(next(it).split()[0])
+                for _ in range(nset):
+                    hdr = next(it).split()
+                    nexp = int(hdr[3])
+                    for _ in range(nexp):
+                        next(it)
+            except StopIteration:
+                break
+            continue
+            
+        # We found a matching element + basis name.
+        if elem in basis:
+            try:
+                nset = int(next(it).split()[0])
+                for _ in range(nset):
+                    hdr = next(it).split()
+                    nexp = int(hdr[3])
+                    for _ in range(nexp):
+                        next(it)
+            except StopIteration:
+                break
+            continue
+
+        # Extract the matched basis
+        try:
+            nset = int(next(it).split()[0])
+            for _ in range(nset):
+                hdr = next(it).split()
+                lmin = int(hdr[1])
+                nexp = int(hdr[3])
+                counts = list(map(int, hdr[4:]))
+                
+                exps_list = []
+                coef_rows = []
+                for _ in range(nexp):
+                    row = next(it).split()
+                    exps_list.append(float(row[0]))
+                    coef_rows.append([float(c) for c in row[1:]])
+                    
+                exps = np.array(exps_list)
+                coef_cols = np.array(coef_rows).T
+                
+                idx = 0
+                for j, n_shells in enumerate(counts):
+                    l = lmin + j
+                    for _ in range(n_shells):
+                        coefs = coef_cols[idx].copy()
+                        basis[elem].append((l, exps.copy(), coefs))
+                        idx += 1
+        except StopIteration:
+            break
+
+    return basis
+
+def parse_basis_old(fname, wanted):
 
     basis = collections.defaultdict(list)
 
@@ -45,6 +125,7 @@ def parse_basis(fname, wanted):
 
     for line in it:
         line = line.strip()
+
         if not line or line.startswith("#"):
             continue
 
@@ -60,7 +141,9 @@ def parse_basis(fname, wanted):
         nset = int(next(it).split()[0])
 
         for _ in range(nset):
+
             hdr = next(it).split()
+
             lmin = int(hdr[1])
             nexp = int(hdr[3])
             counts = list(map(int, hdr[4:]))
@@ -77,15 +160,22 @@ def parse_basis(fname, wanted):
             coef_cols = np.array(coef_rows).T
 
             idx = 0
+
             for j, n_shells in enumerate(counts):
+
                 l = lmin + j
+
                 for _ in range(n_shells):
+
+                    coefs = coef_cols[idx].copy()
                     basis[elem].append(
-                        (l, exps.copy(), coef_cols[idx].copy())
+                        (l, exps.copy(), coefs)
                     )
+
                     idx += 1
 
     return basis
+
 
 
 # ============================================================

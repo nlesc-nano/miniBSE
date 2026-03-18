@@ -6,11 +6,12 @@
 #include <stdexcept>
 #include <thread>
 #include <cmath>
+#include <mutex>
 
 namespace py = pybind11;
 
 // 1. Ultra-fast custom float parser (Natively handles 'D' and 'E')
-inline float parse_scientific(const char* p) {
+inline double parse_scientific(const char* p) {
     while (isspace(*p)) p++;
     bool neg = false;
     if (*p == '-') { neg = true; p++; }
@@ -61,24 +62,47 @@ bool is_header_line_strict(char* str, int& n_cols) {
     return n_cols > 0;
 }
 
-// 3. Extract the last N floats from a line in-place
-std::vector<float> extract_last_n_floats(char* line, int n) {
-    std::vector<char*> toks;
-    toks.reserve(n + 10);
-    char* p = line;
-    while (*p) {
-        while (isspace(*p)) { *p = '\0'; p++; }
-        if (!*p) break;
-        toks.push_back(p);
-        while (*p && !isspace(*p)) p++;
+// 3. Extract the last N floats from a line in-place safely
+std::vector<double> extract_last_n_floats(const std::string& line, int n, int line_num) {
+    std::vector<double> result(n);
+    int idx = n - 1;
+    int end = line.size() - 1;
+
+    while (idx >= 0 && end >= 0) {
+        // Skip trailing spaces
+        while (end >= 0 && isspace(line[end])) end--;
+        if (end < 0) break;
+
+        int start = end;
+        while (start >= 0) {
+            // Standard space delimiter
+            if (isspace(line[start])) break;
+            
+            // Catch merged CP2K columns (e.g. 0.123-0.123)
+            if (line[start] == '-' || line[start] == '+') {
+                if (start > 0) {
+                    char prev = line[start - 1];
+                    // If the sign is NOT preceded by an exponent (E/D) or a space, it's a merged number boundary
+                    if (prev != 'E' && prev != 'e' && prev != 'D' && prev != 'd' && !isspace(prev)) {
+                        start--; // Step back to include the sign in the token
+                        break;
+                    }
+                }
+            }
+            start--;
+        }
+
+        std::string token = line.substr(start + 1, end - start);
+        result[idx] = parse_scientific(token.c_str());
+
+        idx--;
+        end = start;
     }
-    
-    std::vector<float> vals(n);
-    int start = (int)toks.size() - n;
-    for (int i = 0; i < n; ++i) {
-        vals[i] = parse_scientific(toks[start + i]);
+
+    if (idx >= 0) {
+        throw std::runtime_error("Could not extract enough floats on line " + std::to_string(line_num) + "\nLine: " + line);
     }
-    return vals;
+    return result;
 }
 
 // Struct to hold block metadata for threading
@@ -89,7 +113,7 @@ struct BlockInfo {
 };
 
 py::tuple parse_cp2k_mos_cpp(const std::string& filename, int n_ao_total) {
-    // 1. GULP THE ENTIRE FILE INTO MEMORY (~0.5 seconds)
+    // 1. GULP THE ENTIRE FILE INTO MEMORY
     std::ifstream file(filename, std::ios::binary | std::ios::ate);
     if (!file.is_open()) throw std::runtime_error("C++ Error: Could not open file.");
     
@@ -100,7 +124,7 @@ py::tuple parse_cp2k_mos_cpp(const std::string& filename, int n_ao_total) {
     if (!file.read(buffer.data(), size)) throw std::runtime_error("C++ Error: Failed to read file.");
     buffer[size] = '\0';
 
-    // 2. FIND ALL LINES (~0.2 seconds)
+    // 2. FIND ALL LINES
     std::vector<char*> lines;
     lines.reserve(size / 50); 
     lines.push_back(buffer.data());
@@ -111,7 +135,7 @@ py::tuple parse_cp2k_mos_cpp(const std::string& filename, int n_ao_total) {
         }
     }
 
-    // 3. FIND ALL BLOCKS (Sequential scan, ~0.05 seconds)
+    // 3. FIND ALL BLOCKS 
     std::vector<BlockInfo> blocks;
     int current_col_offset = 0;
     for (size_t i = 0; i < lines.size(); ++i) {
@@ -119,7 +143,7 @@ py::tuple parse_cp2k_mos_cpp(const std::string& filename, int n_ao_total) {
         if (is_header_line_strict(lines[i], n_cols)) {
             blocks.push_back({(int)i, n_cols, current_col_offset});
             current_col_offset += n_cols;
-            i += (3 + n_ao_total); // Jump to the end of this block!
+            i += (3 + n_ao_total); // Jump to the end of this block
         }
     }
 
@@ -127,42 +151,58 @@ py::tuple parse_cp2k_mos_cpp(const std::string& filename, int n_ao_total) {
     if (n_mo_total == 0) throw std::runtime_error("C++ Error: No MO blocks detected.");
 
     // 4. ALLOCATE NUMPY ARRAYS
-    auto eps_np = py::array_t<float>(n_mo_total);
-    auto occ_np = py::array_t<float>(n_mo_total);
-    auto C_np = py::array_t<float>({n_ao_total, n_mo_total});
+    auto eps_np = py::array_t<double>(n_mo_total);
+    auto occ_np = py::array_t<double>(n_mo_total);
+    auto C_np = py::array_t<double>({n_ao_total, n_mo_total});
 
-    float* eps_ptr = eps_np.mutable_data();
-    float* occ_ptr = occ_np.mutable_data();
-    float* C_ptr = C_np.mutable_data();
+    double* eps_ptr = eps_np.mutable_data();
+    double* occ_ptr = occ_np.mutable_data();
+    double* C_ptr = C_np.mutable_data();
 
-    // 5. MULTITHREADED PARSING (~0.5 seconds)
+    // 5. MULTITHREADED PARSING WITH ERROR CATCHING
     int num_threads = std::thread::hardware_concurrency();
-    if (num_threads == 0) num_threads = 4; // fallback
+    if (num_threads == 0) num_threads = 4;
     
     std::vector<std::thread> workers;
+    std::mutex err_mutex;
+    std::string thread_error = "";
+
     for (int tid = 0; tid < num_threads; ++tid) {
         workers.emplace_back([&, tid]() {
-            // Each thread processes a staggered subset of blocks
-            for (size_t b = tid; b < blocks.size(); b += num_threads) {
-                const auto& block = blocks[b];
-                int start = block.line_idx;
-                int n_cols = block.n_cols;
-                int col_off = block.col_offset;
+            try {
+                for (size_t b = tid; b < blocks.size(); b += num_threads) {
+                    const auto& block = blocks[b];
+                    int start = block.line_idx;
+                    int n_cols = block.n_cols;
+                    int col_off = block.col_offset;
 
-                // Energies
-                auto eps_vals = extract_last_n_floats(lines[start + 1], n_cols);
-                for (int c = 0; c < n_cols; ++c) eps_ptr[col_off + c] = eps_vals[c];
-
-                // Occupations
-                auto occ_vals = extract_last_n_floats(lines[start + 2], n_cols);
-                for (int c = 0; c < n_cols; ++c) occ_ptr[col_off + c] = occ_vals[c];
-
-                // AO Coefficients
-                for (int ao = 0; ao < n_ao_total; ++ao) {
-                    auto ao_vals = extract_last_n_floats(lines[start + 3 + ao], n_cols);
-                    for (int c = 0; c < n_cols; ++c) {
-                        C_ptr[ao * n_mo_total + (col_off + c)] = ao_vals[c];
+                    // Bounds Check File End
+                    if (start + 3 + n_ao_total >= lines.size()) {
+                        throw std::runtime_error("Unexpected End of File at block starting at line " + std::to_string(start));
                     }
+
+                    // Energies
+                    auto eps_vals = extract_last_n_floats(lines[start + 1], n_cols, start + 1);
+                    for (int c = 0; c < n_cols; ++c) eps_ptr[col_off + c] = eps_vals[c];
+
+                    // Occupations
+                    auto occ_vals = extract_last_n_floats(lines[start + 2], n_cols, start + 2);
+                    for (int c = 0; c < n_cols; ++c) occ_ptr[col_off + c] = occ_vals[c];
+
+                    // AO Coefficients
+                    for (int ao = 0; ao < n_ao_total; ++ao) {
+                        int current_line = start + 3 + ao;
+                        auto ao_vals = extract_last_n_floats(lines[current_line], n_cols, current_line);
+                        for (int c = 0; c < n_cols; ++c) {
+                            C_ptr[ao * n_mo_total + (col_off + c)] = ao_vals[c];
+                        }
+                    }
+                }
+            } catch (const std::exception& e) {
+                // Safely lock and pass the error back to the main thread
+                std::lock_guard<std::mutex> lock(err_mutex);
+                if (thread_error.empty()) {
+                    thread_error = e.what();
                 }
             }
         });
@@ -170,6 +210,11 @@ py::tuple parse_cp2k_mos_cpp(const std::string& filename, int n_ao_total) {
 
     // Wait for all threads to finish
     for (auto& w : workers) w.join();
+
+    // If any thread crashed, throw the Python exception now!
+    if (!thread_error.empty()) {
+        throw std::runtime_error(thread_error);
+    }
 
     return py::make_tuple(C_np, eps_np, occ_np);
 }

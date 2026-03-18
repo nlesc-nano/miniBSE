@@ -8,10 +8,10 @@ from miniBSE.hardness import build_gamma, build_resta_mnok
 
 class ExcitonSolver:
     def __init__(self, C, eps, occ, overlap, atom_symbols, atom_coords, atom_ao_ranges, 
-                 homo_index, n_occ, n_virt, scissor_ev, kernel, alpha, material=None, 
-                 include_exchange=False, e_thresh=None, f_thresh=0.0, 
+                 homo_index, n_occ, n_virt, scissor_ev, kernel, alpha, beta=0.0, material=None, 
+                 include_exchange=False, estimate_qp=False, e_thresh=None, f_thresh=0.0, 
                  mu_ia_x=None, mu_ia_y=None, mu_ia_z=None, eps_out=2.0, 
-                 soc_U=None, soc_E=None, device="numpy"): 
+                 soc_U=None, soc_E=None, device="numpy", precomputed_sigma=None): 
 
         self.C = C
         self.overlap = overlap
@@ -21,33 +21,47 @@ class ExcitonSolver:
         self.homo_index = homo_index
         self.soc_flag = (soc_U is not None and soc_E is not None)
 
-        # --- UPDATED KERNEL LOGIC ---
+        # --- UPDATED KERNEL LOGIC in solver.py ---
         if kernel.lower() == "resta":
             print(f"  [Solver] Using Screened Resta-MNOK kernel for material: {material}")
-            gamma = build_resta_mnok(
-                atom_symbols=atom_symbols, 
-                coords=atom_coords, 
-                alpha=alpha, 
-                material_name=material,
-                eps_out=eps_out  # Passed from CLI
+            gamma_qp, gamma_bse = build_resta_mnok(
+                atom_symbols=atom_symbols, coords=atom_coords,
+                alpha=alpha, material_name=material, eps_out=eps_out
             )
         else:
-            print("  [Solver] Using standard Grimme sTDA MNOK kernel.")
-            gamma = build_gamma(
-                atom_symbols=atom_symbols, 
-                coords=atom_coords, 
-                alpha=alpha
-            ) 
+            print(f"  [Solver] Using standard Grimme sTDA MNOK kernel.")
+            print(f"           -> Screened W/BSE (alpha = {alpha:.3f})")
+            g = build_gamma(atom_symbols=atom_symbols, coords=atom_coords, alpha=alpha, beta=0.0)
+            gamma_qp, gamma_bse = g, g
+
+        print(f"  [Solver] Building Bare Kernel V (alpha = 1.000, beta = 0.000)")
+        # This MUST be beta=0.0 to preserve your baseline COH polarization!
+        gamma_bare = build_gamma(atom_symbols=atom_symbols, coords=atom_coords, alpha=1.0, beta=0.0)
+
+        print(f"  [Solver] Building Exact Exchange Penalty (beta = {beta:.3f})")
+        # Build the stiffened matrix, and subtract the baseline to isolate ONLY the penalty
+        gamma_beta_full = build_gamma(atom_symbols=atom_symbols, coords=atom_coords, alpha=1.0, beta=beta)
+        gamma_penalty = gamma_beta_full - gamma_bare
 
         self.ham = ExcitonHamiltonian(
             C=C, eps=eps, overlap=overlap, atom_ao_ranges=atom_ao_ranges,
             homo_index=homo_index, n_occ=n_occ, n_virt=n_virt, scissor_ev=scissor_ev,
-            gamma=gamma, include_exchange=include_exchange, e_thresh=e_thresh, 
+            gamma_qp=gamma_qp,        # NEW
+            gamma_bse=gamma_bse,      # NEW
+            material=material,
+            gamma_bare=gamma_bare,
+            gamma_penalty=gamma_penalty,
+            alpha=alpha,            
+            include_exchange=include_exchange, estimate_qp=estimate_qp, e_thresh=e_thresh, 
             f_thresh=f_thresh, mu_ia_x=mu_ia_x, mu_ia_y=mu_ia_y, mu_ia_z=mu_ia_z, 
-            soc_U=soc_U, soc_E=soc_E, device=device
+            soc_U=soc_U, soc_E=soc_E, device=device, precomputed_sigma=precomputed_sigma # <--- ADDED
         )
 
     def solve(self, nroots=10, full_diag=False, tol=1e-5):
+        if self.ham.dim == 0:
+            print("ERROR: Active space dimension is 0! Your energy threshold is filtering out all transitions.")
+            import sys; sys.exit(1)
+
         if full_diag:
             print(f"  Building dense Hamiltonian in truncated space ({self.ham.dim}x{self.ham.dim})...")
             

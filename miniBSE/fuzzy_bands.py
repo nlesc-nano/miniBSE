@@ -238,5 +238,25 @@ def run_fuzzy_bands_and_pdos(args, C_dense, S_dense, eps_shifted, occ, homo_inde
             homo_dict["soc"] = eps_soc[global_spinor_homo_idx]
             lumo_dict["soc"] = eps_soc[global_spinor_homo_idx + 1]
 
-        generate_interactive_plot(has_soc=args.soc_flag, material=args.material, ef=ef_dict, e_homo=homo_dict, e_lumo=lumo_dict, normalize_coop=False)
+        # Generate Spin-Free Dashboard
+    generate_interactive_plot(
+        prefix="sf", 
+        material=args.material, 
+        ef=ef_dict.get("sf", 0.0), 
+        e_homo=homo_dict.get("sf"), 
+        e_lumo=lumo_dict.get("sf"), 
+        normalize_coop=False
+    )
+    
+    # Generate SOC Dashboard (if requested)
+    if args.soc_flag:
+        generate_interactive_plot(
+            prefix="soc", 
+            material=args.material, 
+            ef=ef_dict.get("soc", 0.0), 
+            e_homo=homo_dict.get("soc"), 
+            e_lumo=lumo_dict.get("soc"), 
+            normalize_coop=False
+        )
+
 

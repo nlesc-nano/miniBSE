@@ -87,6 +87,7 @@ PYBIND11_MODULE(libint_cpp, m)
   m.def("overlap",
         [](py::list py_shells, int nthreads) {
           auto shells = convert_shells(py_shells);
+          //libint2::set_solid_harmonics_ordering(libint2::SHGShellOrdering_Standard);
           libint2::initialize();
           Matrix S = licpp::overlap(shells, nthreads);
           libint2::finalize();
@@ -97,6 +98,7 @@ PYBIND11_MODULE(libint_cpp, m)
   m.def("cross_overlap",
         [](py::list py_shells, size_t n_ao, size_t n_prj, int nthreads) {
       auto shells = convert_shells(py_shells);
+      //libint2::set_solid_harmonics_ordering(libint2::SHGShellOrdering_Standard);
       libint2::initialize();
       Matrix X = licpp::cross_overlap(shells, n_ao, n_prj, nthreads);
       libint2::finalize();
@@ -107,6 +109,7 @@ PYBIND11_MODULE(libint_cpp, m)
   m.def("dipole",
         [](py::list py_shells, std::array<double,3> origin, int nthreads) {
           auto shells = convert_shells(py_shells);
+          //libint2::set_solid_harmonics_ordering(libint2::SHGShellOrdering_Standard);
           libint2::initialize();
           auto v = licpp::dipole(shells, origin, nthreads);
           libint2::finalize();
@@ -127,6 +130,7 @@ PYBIND11_MODULE(libint_cpp, m)
         [](py::list py_ao_shells, py::list py_projectors, int nthreads) {
             auto ao_shells = convert_shells(py_ao_shells);
             auto projectors = convert_projectors(py_projectors);
+            //libint2::set_solid_harmonics_ordering(libint2::SHGShellOrdering_Standard);
             libint2::initialize();
             Matrix B = licpp::compute_hgh_projector_overlaps(ao_shells, projectors, nthreads);
             libint2::finalize();
@@ -143,7 +147,7 @@ PYBIND11_MODULE(libint_cpp, m)
               kpts.reserve(buf.shape(0));
               for (ssize_t i=0;i<buf.shape(0);++i)
                   kpts.push_back({buf(i,0),buf(i,1),buf(i,2)});
-  
+              //libint2::set_solid_harmonics_ordering(libint2::SHGShellOrdering_Standard);
               libint2::initialize();
               Eigen::MatrixXcd F = licpp::ao_ft_complex(shells, kpts, nthreads);
               libint2::finalize();
@@ -160,7 +164,7 @@ PYBIND11_MODULE(libint_cpp, m)
               
               Eigen::Matrix3d L;
               std::memcpy(L.data(), lattice_A.data(), sizeof(double)*9);
-    
+              //libint2::set_solid_harmonics_ordering(libint2::SHGShellOrdering_Standard); 
               libint2::initialize();
               Matrix S = licpp::overlap_pbc(shells, L, cutoff_A, nthreads);
               libint2::finalize();
@@ -211,3 +215,4 @@ PYBIND11_MODULE(libint_cpp, m)
           "Ultra-fast C++ parser for CP2K MO text files",
           py::arg("filename"), py::arg("n_ao_total"));
 }
+

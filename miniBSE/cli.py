@@ -18,9 +18,7 @@ from miniBSE.constants import HA_TO_EV
 from miniBSE.exciton_analysis import ExcitonAnalyzer, plot_analysis_summary
 from miniBSE.integrals import compute_dipole_ao
 from miniBSE.oscillator import compute_oscillator_strengths
-from miniBSE.hardness import MATERIAL_DB
-
-# --- Refactored Imports ---
+from miniBSE.hardness import MATERIAL_DB, estimate_brus_qp_gap, estimate_gw_qp_gap
 from miniBSE.orbital_analysis import compute_spin_character, print_orbital_summary
 from miniBSE.fuzzy_bands import run_fuzzy_bands_and_pdos
 
@@ -147,6 +145,54 @@ def run_solver_and_analysis(solver, coords_ang, syms, shells, mu_ia_x, mu_ia_y, 
 
         print(f"{n+1:5d} {res['energy']:8.3f} {res['f_osc']:8.4f} | {res['PR']:5.1f} {res['d_eh']:7.2f} {res['d_CT']:7.2f} {res['sigma_h']:6.1f} {res['sigma_e']:6.1f} | {ex_type:>8}")
 
+    # =========================================================================
+    # EXCITON CUBE GENERATION (MOs are now generated globally before this)
+    # =========================================================================
+    if getattr(args, 'cube', False):
+        from miniBSE.exciton_cube import generate_cubes
+        
+        bse_states_arg = getattr(args, 'bse_states', None)
+        if bse_states_arg:
+            top_indices = [i - 1 for i in bse_states_arg if (i - 1) < len(f_strengths)]
+            n_bse = len(top_indices)
+        else:
+            n_bse = min(getattr(args, 'nbse', 3), len(f_strengths))
+            top_indices = np.argsort(f_strengths)[-n_bse:][::-1]
+        
+        bse_states = {}
+        for idx in top_indices:
+            raw_vec = vectors[:, idx]
+            if solver.soc_flag:
+                X_IA = np.zeros(solver.ham.dim_spinor_full, dtype=complex)
+                if hasattr(solver.ham, 'valid_spinor_idx'): X_IA[solver.ham.valid_spinor_idx] = raw_vec
+                else: X_IA = raw_vec
+                X_IA = X_IA.reshape(solver.ham.n_occ_spinor, solver.ham.n_virt_spinor)
+                
+                n_mo = soc_U.shape[0] // 2
+                n_occ_sp = solver.ham.n_occ_spinor
+                
+                X_ia = soc_U[:n_mo, :n_occ_sp].conj() @ X_IA @ soc_U[:n_mo, n_occ_sp:].T + \
+                       soc_U[n_mo:, :n_occ_sp].conj() @ X_IA @ soc_U[n_mo:, n_occ_sp:].T
+                cube_vec = np.abs(X_ia[solver.ham.valid_i, solver.ham.valid_a])
+            else:
+                cube_vec = raw_vec
+            
+            bse_states[f"exciton_state_{idx + 1}{suffix}"] = cube_vec
+            
+        print(f"\n--- Generating Cubes ({n_bse} Excitons) ---")
+        use_cpp_writer = not getattr(args, 'disable_cpp_cube', False)
+        
+        generate_cubes(
+            solver=solver, 
+            bse_states_dict=bse_states, 
+            mo_list=[],     # MOs are generated earlier
+            spinor_list=[], # Spinors are generated earlier
+            soc_U=soc_U if solver.soc_flag else None,
+            shells=shells, symbols=syms, coords=coords_ang, 
+            spacing_ang=args.cube_spacing, nthreads=args.nthreads,
+            use_cpp=use_cpp_writer
+        )
+
     if args.write_csv:
         import csv
         csv_file = f"exciton_results{suffix}.csv"
@@ -184,7 +230,7 @@ def run_solver_and_analysis(solver, coords_ang, syms, shells, mu_ia_x, mu_ia_y, 
             plot_spectrum(x_grid, y_grid, energies_ev, f_strengths, filename=plot_file, show=args.show)
 
     if args.plot or args.show:
-        ref_gap = soc_gap + scissor if (solver.soc_flag and soc_gap is not None) else args.qp_gap
+        ref_gap = soc_gap + scissor if (solver.soc_flag and soc_gap is not None) else args.qp_gap_num
         metrics = {
             "dft_gap": dft_gap, "qp_correction": scissor, "confinement_energy": confinement_energy, 
             "binding_energy": ref_gap - energies_ev[0] if len(energies_ev) > 0 else 0.0, 
@@ -209,14 +255,16 @@ def main():
     parser.add_argument("--e_thresh", type=float, default=None)
     parser.add_argument("--f_thresh", type=float, default=1e-4)
 
-    parser.add_argument("--qp_gap", type=float)
+    parser.add_argument("--qp_gap", type=str, default="brus")
     parser.add_argument("--soc", type=float, default=0.0)
     parser.add_argument("--soc_flag", action="store_true")
     parser.add_argument("--gth_file", type=str, default=None)
 
     parser.add_argument("--kernel", choices=["bse", "resta"], default="bse")
-    parser.add_argument("--alpha", type=float, default=1.0)
+    parser.add_argument("--alpha", type=float, default=1.0, help="Macroscopic screening factor (often 1/eps_inf) for the BSE kernel.")
+    parser.add_argument("--beta", type=float, default=0.0, help="Exact exchange fraction [0.0 to 1.0] for Hubbard U stiffening on the QP bare kernel.")
     parser.add_argument("--exchange", action="store_true")
+    parser.add_argument("--estimate_qp", action="store_true", help="Compute G0W0-lite Quasiparticle corrections via COHSEX")
     parser.add_argument("--material", type=str, default="DEFAULT")
     parser.add_argument("--eps-out", type=float, default=2.0)
 
@@ -224,8 +272,17 @@ def main():
     parser.add_argument("--sigma", type=float, default=0.1)
     parser.add_argument("--plot", action="store_true")
     parser.add_argument("--show", action="store_true")
+    
+    # --- Cube Arguments ---
     parser.add_argument("--cube", action="store_true")
     parser.add_argument("--cube-spacing", type=float, default=0.5)
+    parser.add_argument("--disable_cpp_cube", action="store_true")
+    parser.add_argument("--nhomos", type=int, default=2, help="Number of HOMO states (spatial or spinor) to export")
+    parser.add_argument("--nlumos", type=int, default=2, help="Number of LUMO states (spatial or spinor) to export")
+    parser.add_argument("--nbse", type=int, default=3, help="Number of Top Exciton states to export if bse_states is not provided")
+    parser.add_argument("--bse_states", type=int, nargs='+', help="Specific exciton states to plot (1-indexed, e.g., 2 9 19)")
+    # ----------------------
+    
     parser.add_argument("--write-csv", action="store_true")
     parser.add_argument("--csv-roots", type=int, default=10)
     parser.add_argument("--time", type=float, default=0.0)
@@ -268,16 +325,27 @@ def main():
     print(" miniBSE - Post-DFT Exciton Solver")
     print("===================================================")
 
+    print("\n--- Parsing Geometry and Basis Set ---")
+    t0_parse = time.time()
     syms, coords_ang = read_xyz(args.xyz)
     basis_dict = parse_basis(args.basis_txt, args.basis_name)
     shells = build_shell_dicts(syms, coords_ang, basis_dict)
+    shells = [{**sh, 'pure': True} for sh in shells] # Use Sphericals 
     n_ao = count_ao_from_shells(shells)
     atom_ao_ranges = build_atom_ao_ranges(shells)
+    print(f"  -> Parsed in {time.time() - t0_parse:.2f} s | Total AOs: {n_ao}")
 
     print("\n--- Computing AO overlap ---")
+    t0_s = time.time()
     S = libint_cpp.overlap(shells, args.nthreads)
+    print(f"  ->  Overlap computed in {time.time() - t0_s:.2f} s")
 
+    print(f"\n--- Reading Molecular Orbitals from {args.mo_file} ---")
+    t0_mos = time.time()
     C, eps, occ = read_mos_auto(args.mo_file, n_ao, verbose=True)
+    print(f"  -> MOs parsed in {time.time() - t0_mos:.2f} s | C shape {C.shape}")
+
+    t0_gap = time.time()
     homo_index = np.where(occ > 0.0)[0].max()
     eps = eps * HA_TO_EV
     
@@ -287,20 +355,70 @@ def main():
     e_homo = eps_shifted[homo_index]
     e_lumo = eps_shifted[homo_index + 1]
 
+    # REPLACE IT WITH THIS:
     dft_gap = eps[homo_index + 1] - eps[homo_index]
-    scissor = args.qp_gap - dft_gap
-
-    # -----------------------------------------------------------------
-    # Unified S@C Computation (Prevents duplicated Muliken logic)
-    # -----------------------------------------------------------------
-    C_dense = C.toarray() if hasattr(C, 'toarray') else C
-    S_dense = S.toarray() if hasattr(S, 'toarray') else S
+    target_qp_gap = dft_gap
+    confinement_energy = 0.0
     
-    SC_dense = S_dense @ C_dense
-    pops_sf = np.real(C_dense.conj() * SC_dense)
+    if isinstance(args.qp_gap, str):
+        if args.qp_gap.lower() == "brus":
+            target_qp_gap = estimate_brus_qp_gap(np.array(coords_ang), syms, args.material)
+            if target_qp_gap is not None:
+                scissor = target_qp_gap - dft_gap
+                confinement_energy = target_qp_gap - MATERIAL_DB.get(args.material.upper(), [0]*9)[3]
+            else:
+                print("  [Warning] Brus estimation failed. Falling back to zero scissor.")
+                scissor = 0.0
+                target_qp_gap = dft_gap
+                
+        elif args.qp_gap.lower() == "gw":
+            # Compute the Scaled GW Scissor directly
+            gw_scissor = estimate_gw_qp_gap(np.array(coords_ang), syms, args.material, args.eps_out)
+            
+            if gw_scissor is not None:
+                scissor = gw_scissor
+                target_qp_gap = dft_gap + scissor
+            else:
+                print("  [Warning] Scaled GW estimation failed. Falling back to zero scissor.")
+                scissor = 0.0
+                target_qp_gap = dft_gap
+                
+            if args.estimate_qp:
+                print("  [Note] qp_gap is set to 'gw'. This provides the full Many-Body/Polarization shift.")
+                print("  [Note] You should set 'estimate_qp: false' in config.yaml to avoid double-counting COHSEX!")
+    else:
+        # Numeric explicit gap provided
+        target_qp_gap = float(args.qp_gap)
+        scissor = target_qp_gap - dft_gap
+    
+    print(f"\n  [DFT] Initial Gap  : {dft_gap:.4f} eV")
+    print(f"  [QP]  Target Gap   : {target_qp_gap:.4f} eV")
+    print(f"  [QP]  Scissor Shift: {scissor:.4f} eV")
+     
+    print(f"  -> Energy axis shifted and target gap resolved in {time.time() - t0_gap:.4f} s")
 
     # -----------------------------------------------------------------
-    # 1. BSE Active Space (Strictly bound by e_thresh)
+    # Unified S@C Computation
+    # -----------------------------------------------------------------
+    print("\n--- Computing Unified S@C Population Analysis ---")
+    t0_pop = time.time()
+    C_dense = C.toarray() if hasattr(C, 'toarray') else C
+    SC_dense = S @ C_dense 
+    
+    # === DIAGNOSTIC: STRICT C^T S C ORTHONORMALITY CHECK ===
+    print("\n  [Diag] Testing MO Orthonormality (C^T S C = I) ...")
+    norm_matrix = C_dense.T @ SC_dense
+    diags = np.diag(norm_matrix)
+    orth_err = np.linalg.norm(norm_matrix - np.eye(C_dense.shape[1]))
+
+    print(f"[CHECK] ||CᵀSC - I|| = {orth_err:.3e}")
+    # ===========================================================
+
+    pops_sf = np.real(C_dense.conj() * SC_dense)
+    print(f"  -> S@C projection and populations computed in {time.time() - t0_pop:.2f} s")
+
+    # -----------------------------------------------------------------
+    # BSE Active Space Setup
     # -----------------------------------------------------------------
     if args.e_thresh is not None:
         raw_gap = eps[homo_index + 1:].reshape(1, -1) - eps[:homo_index + 1].reshape(-1, 1)
@@ -312,102 +430,25 @@ def main():
 
     bse_active_indices = np.arange(homo_index - bse_n_occ + 1, homo_index + 1 + bse_n_virt)
     bse_soc_E, bse_soc_U, bse_spinor_homo_idx = None, None, None
+    calculated_soc_gap = None
     
     if args.soc_flag:
         print(f"\n--- Computing SOC Spinor Subspace for BSE (Small Window) ---")
         from miniBSE.soc_utils import compute_spinor_subspace
         bse_soc_E, bse_soc_U = compute_spinor_subspace(
             atom_symbols=syms, coords_ang=coords_ang, shells=shells, 
-            C_AO=C_dense, eps_Ha=eps / HA_TO_EV, S_AO=S_dense, 
+            C_AO=C_dense, eps_Ha=eps / HA_TO_EV, S_AO=S, 
             active_indices=bse_active_indices, gth_file=args.gth_file, nthreads=args.nthreads
         )
         bse_soc_E = (bse_soc_E * HA_TO_EV) - e_fermi_raw
         bse_spinor_homo_idx = (bse_n_occ * 2) - 1
         bse_soc_E -= (bse_soc_E[bse_spinor_homo_idx] + bse_soc_E[bse_spinor_homo_idx + 1]) / 2.0
 
-    # -----------------------------------------------------------------
-    # 2. MODULE DELEGATION: FUZZY BANDS & PDOS (Large Window)
-    # -----------------------------------------------------------------
-    if getattr(args, 'run_fuzzy', False):
-        fuzzy_mask = np.abs(eps_shifted) <= args.soc_window
-        fuzzy_active_indices = np.where(fuzzy_mask)[0]
-        
-        fuzzy_soc_E, fuzzy_soc_U, fuzzy_spinor_homo_idx = None, None, None
-        if args.soc_flag:
-            print(f"\n--- Computing SOC Spinor Subspace for Fuzzy Bands (Large Window: ±{args.soc_window} eV) ---")
-            fuzzy_soc_E, fuzzy_soc_U = compute_spinor_subspace(
-                atom_symbols=syms, coords_ang=coords_ang, shells=shells, 
-                C_AO=C_dense, eps_Ha=eps / HA_TO_EV, S_AO=S_dense, 
-                active_indices=fuzzy_active_indices, gth_file=args.gth_file, nthreads=args.nthreads
-            )
-            fuzzy_soc_E = (fuzzy_soc_E * HA_TO_EV) - e_fermi_raw
-            f_n_occ = np.sum(fuzzy_active_indices <= homo_index)
-            fuzzy_spinor_homo_idx = (f_n_occ * 2) - 1
-            fuzzy_soc_E -= (fuzzy_soc_E[fuzzy_spinor_homo_idx] + fuzzy_soc_E[fuzzy_spinor_homo_idx + 1]) / 2.0
-
-        run_fuzzy_bands_and_pdos(
-            args, C_dense, S_dense, eps_shifted, occ, homo_index, e_homo, e_lumo, e_fermi_raw, 
-            syms, coords_ang, shells, pops_sf, 
-            soc_active_indices=fuzzy_active_indices, soc_E_act=fuzzy_soc_E, soc_U_act=fuzzy_soc_U, spinor_homo_idx=fuzzy_spinor_homo_idx
-        )
-
     print("\n--- Spin-Free MO Population Analysis ---")
     print_orbital_summary(eps_shifted, occ, homo_index, pops_sf, syms, shells, is_soc=False)
 
-    print("\n--- Computing Transition Dipoles ---")
-    mu_ao_x, mu_ao_y, mu_ao_z = compute_dipole_ao(shells, nthreads=args.nthreads)
-
-    compute_device = "numpy"
-    if args.device != "numpy":
-        try:
-            import torch
-            if args.device == "auto":
-                if torch.cuda.is_available(): compute_device = "cuda"
-                elif hasattr(torch.backends, "mps") and platform.machine() == 'arm64': compute_device = "mps"
-                else: compute_device = "cpu"
-            else: compute_device = args.device
-            torch.set_num_threads(args.nthreads)
-        except ImportError: pass
-
-    # Dipoles strictly use the small BSE space!
-    C_occ = C[:, homo_index - bse_n_occ + 1 : homo_index + 1].astype(np.float32)
-    C_virt = C[:, homo_index + 1 : homo_index + 1 + bse_n_virt].astype(np.float32)
-
-    def transform_dipole(mu_ao):
-        if compute_device in ["cuda", "mps"]:
-            import torch
-            dev = torch.device(compute_device)
-            return (torch.tensor(C_occ, device=dev).T @ (torch.tensor(mu_ao.astype(np.float32), device=dev) @ torch.tensor(C_virt, device=dev))).cpu().numpy().astype(np.float64)
-        return (C_occ.T @ (mu_ao.astype(np.float32) @ C_virt)).astype(np.float64)
-
-    mu_ia_x, mu_ia_y, mu_ia_z = transform_dipole(mu_ao_x), transform_dipole(mu_ao_y), transform_dipole(mu_ao_z)
-    del mu_ao_x, mu_ao_y, mu_ao_z; gc.collect()
-
-    db_gap = MATERIAL_DB.get(args.material.upper(), MATERIAL_DB["DEFAULT"])[3]
-    confinement_energy = args.qp_gap - db_gap
-
-    # =========================================================================
-    # EXECUTION BLOCK 1: SPIN-FREE SOLVER
-    # =========================================================================
-    solver_sf = ExcitonSolver(
-        C=C, eps=eps_shifted, occ=occ, overlap=S, atom_symbols=syms, atom_coords=np.array(coords_ang), # <-- eps_shifted
-        atom_ao_ranges=atom_ao_ranges, homo_index=homo_index, n_occ=bse_n_occ, n_virt=bse_n_virt, 
-        scissor_ev=scissor, kernel=args.kernel, alpha=args.alpha, include_exchange=args.exchange, 
-        material=args.material, e_thresh=args.e_thresh, f_thresh=args.f_thresh, 
-        mu_ia_x=mu_ia_x, mu_ia_y=mu_ia_y, mu_ia_z=mu_ia_z, eps_out=args.eps_out,
-        soc_U=None, soc_E=None, device=compute_device
-    )
-
-    suffix_sf = "_sf" if args.soc_flag else ""
-    run_solver_and_analysis(solver_sf, np.array(coords_ang), syms, shells, mu_ia_x, mu_ia_y, mu_ia_z, 
-                            dft_gap, scissor, confinement_energy, args, suffix=suffix_sf)
-
-    # =========================================================================
-    # EXECUTION BLOCK 2: SPIN-ORBIT COUPLING SOLVER
-    # =========================================================================
     if args.soc_flag:
         if args.gth_file is None: sys.exit("ERROR: --gth_file is required when --soc_flag is enabled.")
-            
         print("\n--- SOC Spinor Population Analysis (BSE Active Space) ---")
         t_pop = time.time()
         
@@ -428,17 +469,184 @@ def main():
         
         soc_occ = np.zeros_like(bse_soc_E)
         soc_occ[:bse_spinor_homo_idx + 1] = 1.0
-        
         soc_offset = (homo_index - bse_n_occ + 1) * 2 
         print_orbital_summary(bse_soc_E, soc_occ, bse_spinor_homo_idx, pops_soc_act, syms, shells, is_soc=True, offset=soc_offset)
- 
         calculated_soc_gap = bse_soc_E[bse_spinor_homo_idx + 1] - bse_soc_E[bse_spinor_homo_idx]
 
+        # --- RIGID SCISSOR APPLICATION ---
+        print("\n--- Scissor Operator Application ---")
+        print(f"  Rigid Scissor (Computed above)  : {scissor:+8.4f} eV")
+        print(f"  Spin-Free DFT Gap               : {dft_gap:8.4f} eV")
+        print(f"  SOC-Shrunken DFT Gap            : {calculated_soc_gap:8.4f} eV")
+        
+        final_sf_qp_gap = dft_gap + scissor
+        final_soc_qp_gap = calculated_soc_gap + scissor
+        
+        print(f"  -> Final Spin-Free QP Gap       : {final_sf_qp_gap:8.4f} eV")
+        print(f"  -> Final SOC QP Gap             : {final_soc_qp_gap:8.4f} eV (D_SOC = {dft_gap - calculated_soc_gap:.4f} eV)")
+
+    else:
+        # --- RIGID SCISSOR FOR SPIN-FREE ONLY ---
+        print("\n--- Scissor Operator Application (Spin-Free) ---")
+        print(f"  Rigid Scissor (Computed above)  : {scissor:+8.4f} eV")
+        print(f"  Spin-Free DFT Gap               : {dft_gap:8.4f} eV")
+        print(f"  -> Final Spin-Free QP Gap       : {dft_gap + scissor:8.4f} eV")
+
+    # Update Confinement Energy (Always relative to bulk)
+    db_gap = MATERIAL_DB.get(args.material.upper(), MATERIAL_DB["DEFAULT"])[3]
+    confinement_energy = target_qp_gap - db_gap
+
+    # -----------------------------------------------------------------
+    # EXCITON CUBE GENERATION: EXECUTED BEFORE FUZZY PLOTTING 
+    # -----------------------------------------------------------------
+    if getattr(args, 'cube', False):
+        from miniBSE.exciton_cube import generate_cubes
+        print("\n--- Generating Cubes for MOs / Spinors ---")
+        
+        class DummySolver:
+            def __init__(self):
+                self.C = C_dense
+                self.homo_index = homo_index
+                self.n_occ = bse_n_occ
+                class DummyHam: pass
+                self.ham = DummyHam()
+                self.soc_flag = args.soc_flag
+                if args.soc_flag:
+                    self.ham.n_occ_spinor = bse_spinor_homo_idx + 1
+                    
+        dummy = DummySolver()
+        mo_list = []
+        spinor_list = []
+        n_h = getattr(args, 'nhomos', 2)
+        n_l = getattr(args, 'nlumos', 2)
+       
+        # ALWAYS generate Spin-Free MOs
+        mo_homo = dummy.homo_index
+        mo_list = [mo_homo - i for i in range(n_h) if (mo_homo - i) >= 0]
+        mo_list += [mo_homo + 1 + i for i in range(n_l) if (mo_homo + 1 + i) < dummy.C.shape[1]]
+        
+        # ADDITIONALLY generate Spinors if SOC is enabled
+        if args.soc_flag:
+            sp_homo = dummy.ham.n_occ_spinor - 1
+            spinor_list = [sp_homo - i for i in range(n_h) if (sp_homo - i) >= 0]
+            spinor_list += [sp_homo + 1 + i for i in range(n_l) if (sp_homo + 1 + i) < bse_soc_U.shape[1]]
+ 
+        generate_cubes(
+            solver=dummy, 
+            bse_states_dict={}, 
+            mo_list=mo_list,
+            spinor_list=spinor_list,
+            soc_U=bse_soc_U if args.soc_flag else None,
+            shells=shells, symbols=syms, coords=coords_ang, 
+            spacing_ang=args.cube_spacing, nthreads=args.nthreads,
+            use_cpp=not getattr(args, 'disable_cpp_cube', False)
+        )
+
+    # -----------------------------------------------------------------
+    # MODULE DELEGATION: FUZZY BANDS & PDOS (Large Window)
+    # -----------------------------------------------------------------
+    if getattr(args, 'run_fuzzy', False):
+        fuzzy_mask = np.abs(eps_shifted) <= args.soc_window
+        fuzzy_active_indices = np.where(fuzzy_mask)[0]
+        
+        fuzzy_soc_E, fuzzy_soc_U, fuzzy_spinor_homo_idx = None, None, None
+        if args.soc_flag:
+            print(f"\n--- Computing SOC Spinor Subspace for Fuzzy Bands (Large Window: ±{args.soc_window} eV) ---")
+            from miniBSE.soc_utils import compute_spinor_subspace
+            fuzzy_soc_E, fuzzy_soc_U = compute_spinor_subspace(
+                atom_symbols=syms, coords_ang=coords_ang, shells=shells, 
+                C_AO=C_dense, eps_Ha=eps / HA_TO_EV, S_AO=S, 
+                active_indices=fuzzy_active_indices, gth_file=args.gth_file, nthreads=args.nthreads
+            )
+            fuzzy_soc_E = (fuzzy_soc_E * HA_TO_EV) - e_fermi_raw
+            f_n_occ = np.sum(fuzzy_active_indices <= homo_index)
+            fuzzy_spinor_homo_idx = (f_n_occ * 2) - 1
+            fuzzy_soc_E -= (fuzzy_soc_E[fuzzy_spinor_homo_idx] + fuzzy_soc_E[fuzzy_spinor_homo_idx + 1]) / 2.0
+
+        run_fuzzy_bands_and_pdos(
+            args, C_dense, S, eps_shifted, occ, homo_index, e_homo, e_lumo, e_fermi_raw, 
+            syms, coords_ang, shells, pops_sf, 
+            soc_active_indices=fuzzy_active_indices, soc_E_act=fuzzy_soc_E, soc_U_act=fuzzy_soc_U, spinor_homo_idx=fuzzy_spinor_homo_idx
+        )
+
+
+    # -----------------------------------------------------------------
+    # EARLY EXIT LOGIC (If run_bse is False)
+    # -----------------------------------------------------------------
+    run_bse = getattr(args, 'run_bse', True)
+    if not run_bse:
+        print("\n--- BSE Calculation Skipped (run_bse: false) ---")
+        print("\nAll requested tasks finished successfully.")
+        return
+
+    # -----------------------------------------------------------------
+    # BSE CONTINUATION (Only if run_bse is True)
+    # -----------------------------------------------------------------
+    print("\n--- Computing Transition Dipoles ---")
+    t0_dip = time.time()
+    mu_ao_x, mu_ao_y, mu_ao_z = compute_dipole_ao(shells, nthreads=args.nthreads)
+    print(f"  ->  Dipoles computed in {time.time() - t0_dip:.2f} s")
+
+    compute_device = "numpy"
+    if args.device != "numpy":
+        try:
+            import torch
+            if args.device == "auto":
+                if torch.cuda.is_available(): compute_device = "cuda"
+                elif hasattr(torch.backends, "mps") and platform.machine() == 'arm64': compute_device = "mps"
+                else: compute_device = "cpu"
+            else: compute_device = args.device
+            torch.set_num_threads(args.nthreads)
+        except ImportError: pass
+
+    C_occ = C[:, homo_index - bse_n_occ + 1 : homo_index + 1].astype(np.float32)
+    C_virt = C[:, homo_index + 1 : homo_index + 1 + bse_n_virt].astype(np.float32)
+
+    def transform_dipole(mu_ao):
+        half_transformed = mu_ao.astype(np.float32) @ C_virt 
+        if compute_device in ["cuda", "mps"]:
+            import torch
+            dev = torch.device(compute_device)
+            return (torch.tensor(C_occ, device=dev).T @ torch.tensor(half_transformed, device=dev)).cpu().numpy().astype(np.float64)
+        return (C_occ.T @ half_transformed).astype(np.float64)
+
+    mu_ia_x, mu_ia_y, mu_ia_z = transform_dipole(mu_ao_x), transform_dipole(mu_ao_y), transform_dipole(mu_ao_z)
+    del mu_ao_x, mu_ao_y, mu_ao_z; gc.collect()
+
+    # Store this for the analysis printouts later
+    args.qp_gap_num = target_qp_gap
+
+    solver_sf = ExcitonSolver(
+        C=C, eps=eps_shifted, occ=occ, overlap=S, atom_symbols=syms, atom_coords=np.array(coords_ang),
+        atom_ao_ranges=atom_ao_ranges, homo_index=homo_index, n_occ=bse_n_occ, n_virt=bse_n_virt, 
+        scissor_ev=scissor, kernel=args.kernel, alpha=args.alpha, beta=args.beta, include_exchange=args.exchange, 
+        estimate_qp=args.estimate_qp, material=args.material, e_thresh=args.e_thresh, f_thresh=args.f_thresh,
+        mu_ia_x=mu_ia_x, mu_ia_y=mu_ia_y, mu_ia_z=mu_ia_z, eps_out=args.eps_out,
+        soc_U=None, soc_E=None, device=compute_device
+    )
+
+    if args.estimate_qp:
+        # Pull the dynamically calculated QP gap correction from the solver
+        calculated_gap_shift = solver_sf.ham.sigma_virt[0] - solver_sf.ham.sigma_occ[-1]
+        scissor = calculated_gap_shift
+        # Update confinement energy based on the new total gap
+        confinement_energy = (dft_gap + scissor) - db_gap
+
+    suffix_sf = "_sf" if args.soc_flag else ""
+    run_solver_and_analysis(solver_sf, np.array(coords_ang), syms, shells, mu_ia_x, mu_ia_y, mu_ia_z, 
+                            dft_gap, scissor, confinement_energy, args, suffix=suffix_sf)
+
+    # Extract the computed shifts to avoid redundant calculation in SOC
+    precalc_sigma = None
+    if args.estimate_qp and hasattr(solver_sf.ham, 'sigma_occ'):
+        precalc_sigma = (solver_sf.ham.sigma_occ, solver_sf.ham.sigma_virt)
+
+    if args.soc_flag:
         solver_soc = ExcitonSolver(
-            C=C, eps=eps_shifted, occ=occ, overlap=S, atom_symbols=syms, atom_coords=np.array(coords_ang), # <-- eps_shifted
+            C=C, eps=eps_shifted, occ=occ, overlap=S, atom_symbols=syms, atom_coords=np.array(coords_ang),
             atom_ao_ranges=atom_ao_ranges, homo_index=homo_index, n_occ=bse_n_occ, n_virt=bse_n_virt, 
-            scissor_ev=scissor, kernel=args.kernel, alpha=args.alpha, include_exchange=args.exchange, 
-            material=args.material, e_thresh=args.e_thresh, f_thresh=args.f_thresh, 
+            scissor_ev=scissor, kernel=args.kernel, alpha=args.alpha, beta=args.beta, include_exchange=args.exchange, 
+            estimate_qp=args.estimate_qp, material=args.material, e_thresh=args.e_thresh, f_thresh=args.f_thresh, 
             mu_ia_x=mu_ia_x, mu_ia_y=mu_ia_y, mu_ia_z=mu_ia_z, eps_out=args.eps_out,
             soc_U=bse_soc_U, soc_E=bse_soc_E, device=compute_device
         )
