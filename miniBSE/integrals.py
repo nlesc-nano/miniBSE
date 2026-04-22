@@ -1,4 +1,5 @@
 import numpy as np
+import time
 import libint_cpp
 
 def compute_dipole_ao(shells, origin=None, nthreads=1):
@@ -11,4 +12,5 @@ def compute_dipole_ao(shells, origin=None, nthreads=1):
     # libint_cpp.dipole returns a (3, nbf, nbf) numpy array
     mu_ao = libint_cpp.dipole(shells, origin, nthreads)
     return mu_ao[0], mu_ao[1], mu_ao[2]
+
 

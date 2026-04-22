@@ -1,7 +1,13 @@
 #include "cp2k_parser.hpp"
 #include <pybind11/numpy.h>
+#include <iostream>
 #include <fstream>
 #include <vector>
+#include <string>
+#include <sstream>
+#include <fcntl.h>
+#include <unistd.h>
+#include <pybind11/pybind11.h>
 #include <cctype>
 #include <stdexcept>
 #include <thread>
@@ -46,7 +52,7 @@ inline double parse_scientific(const char* p) {
     return neg ? -val : val;
 }
 
-// 2. Strict header check
+// 2. Strict header check (Restored to robust version)
 bool is_header_line_strict(char* str, int& n_cols) {
     n_cols = 0;
     char* p = str;
@@ -135,15 +141,38 @@ py::tuple parse_cp2k_mos_cpp(const std::string& filename, int n_ao_total) {
         }
     }
 
-    // 3. FIND ALL BLOCKS 
+    // 3. FIND ALL BLOCKS (Robust Lookahead + Safe Jump)
     std::vector<BlockInfo> blocks;
     int current_col_offset = 0;
+    
     for (size_t i = 0; i < lines.size(); ++i) {
         int n_cols = 0;
         if (is_header_line_strict(lines[i], n_cols)) {
-            blocks.push_back({(int)i, n_cols, current_col_offset});
-            current_col_offset += n_cols;
-            i += (3 + n_ao_total); // Jump to the end of this block
+            
+            // ANTI-GHOST CHECK: Lookahead to the next line.
+            // A valid header MUST be immediately followed by Energy floats.
+            if (i + 1 < lines.size()) {
+                int energy_tokens = 0;
+                char* p = lines[i + 1];
+                while (*p) {
+                    while (isspace(*p)) p++;
+                    if (!*p) break;
+                    energy_tokens++;
+                    while (!isspace(*p) && *p != '\0') p++;
+                }
+                
+                // If the next line lacks enough tokens, it's a ghost line. Ignore it!
+                if (energy_tokens < n_cols) continue;
+                
+                // Valid Block! Record it.
+                blocks.push_back({(int)i, n_cols, current_col_offset});
+                current_col_offset += n_cols;
+                
+                // SAFEST JUMP: i=Header, i+1=Energy, i+2=Occ, i+3=AO_1.
+                // The last AO is exactly at i + 2 + n_ao_total.
+                // Setting i here ensures the loop's `++i` lands exactly on the next line.
+                i += (2 + n_ao_total);
+            }
         }
     }
 
@@ -218,4 +247,74 @@ py::tuple parse_cp2k_mos_cpp(const std::string& filename, int n_ao_total) {
 
     return py::make_tuple(C_np, eps_np, occ_np);
 }
+
+// 1. Fast State-Machine Parser for CP2K Block-Dense Text
+py::array_t<double> parse_cp2k_block_matrix_cpp(const std::string& filename, int n_ao) {
+    std::ifstream file(filename);
+    if (!file.is_open()) throw std::runtime_error("C++ Error: Could not open cleaned VXC file.");
+
+    auto result_np = py::array_t<double>({n_ao, n_ao});
+    double* ptr = result_np.mutable_data();
+    std::fill(ptr, ptr + (size_t)n_ao * n_ao, 0.0);
+
+    std::string line;
+    std::vector<int> current_cols;
+
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+
+        std::stringstream ss(line);
+        std::vector<std::string> tokens;
+        std::string buf;
+        while (ss >> buf) tokens.push_back(buf);
+
+        if (tokens.empty()) continue;
+
+        // Header lines are only numbers. Data lines have strings (e.g. "Cd", "2s")
+        bool is_header = true;
+        for (const auto& t : tokens) {
+            if (t.find_first_not_of("0123456789") != std::string::npos) {
+                is_header = false;
+                break;
+            }
+        }
+
+        if (is_header) {
+            current_cols.clear();
+            for (const auto& t : tokens) current_cols.push_back(std::stoi(t));
+        } else {
+            // Data Line: Row AtomIdx Sym Orb Val1 Val2 ...
+            // e.g. "1 1 Cd 2s -0.367055 -0.261982 ..."
+            if (tokens.size() < 4 + current_cols.size()) continue; // Safety check
+            
+            int row = std::stoi(tokens[0]) - 1; // 1-based to 0-based indexing
+            for (size_t i = 0; i < current_cols.size(); ++i) {
+                int col = current_cols[i] - 1;
+                double val = std::stod(tokens[i + 4]); // Values start at token index 4
+                ptr[(size_t)row * n_ao + col] = val;
+            }
+        }
+    }
+    return result_np;
+}
+
+// 2. Ultra-Fast Raw Binary Loader
+py::array_t<double> load_raw_binary_matrix_cpp(const std::string& bin_path, int n_ao) {
+    size_t expected_size = (size_t)n_ao * n_ao * sizeof(double);
+    int fd = open(bin_path.c_str(), O_RDONLY);
+    if (fd == -1) throw std::runtime_error("C++ Error: Could not open binary file.");
+
+    auto result_np = py::array_t<double>({n_ao, n_ao});
+    double* ptr = result_np.mutable_data();
+
+    // Direct system read into pre-allocated NumPy buffer
+    if (read(fd, ptr, expected_size) != (ssize_t)expected_size) {
+        close(fd);
+        throw std::runtime_error("C++ Error: Binary file size mismatch. Try deleting the .raw.bin file.");
+    }
+    close(fd);
+    return result_np;
+}
+
+
 

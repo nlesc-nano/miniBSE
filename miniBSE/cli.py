@@ -265,6 +265,8 @@ def main():
     parser.add_argument("--beta", type=float, default=0.0, help="Exact exchange fraction [0.0 to 1.0] for Hubbard U stiffening on the QP bare kernel.")
     parser.add_argument("--exchange", action="store_true")
     parser.add_argument("--estimate_qp", action="store_true", help="Compute G0W0-lite Quasiparticle corrections via COHSEX")
+    parser.add_argument("--use_cohsex_gap", action="store_true", help="Override the tabulated GW gap with the pure COHSEX computed gap")
+    parser.add_argument("--vxc_ao", type=str, default=None, help="Path to cleaned CP2K AO-basis Vxc matrix text file")
     parser.add_argument("--material", type=str, default="DEFAULT")
     parser.add_argument("--eps-out", type=float, default=2.0)
 
@@ -394,9 +396,59 @@ def main():
     print(f"\n  [DFT] Initial Gap  : {dft_gap:.4f} eV")
     print(f"  [QP]  Target Gap   : {target_qp_gap:.4f} eV")
     print(f"  [QP]  Scissor Shift: {scissor:.4f} eV")
-     
-    print(f"  -> Energy axis shifted and target gap resolved in {time.time() - t0_gap:.4f} s")
+   
+    # =========================================================================
+    # DYNAMIC IP & EA PREDICTION (Vacuum-Anchored Projection Method)
+    # =========================================================================
+    dft_homo_raw = eps[homo_index]
+    dft_lumo_raw = eps[homo_index + 1]
+    
+    entry = MATERIAL_DB.get(args.material.upper(), None)
+    
+    if entry is not None and len(entry) >= 14:
+        pbe_h_mono, pbe_l_mono, gw_h_mono, gw_l_mono = entry[10], entry[11], entry[12], entry[13]
+        gap_pbe_mono = pbe_l_mono - pbe_h_mono
+        
+        # 1. Asymmetry Fractions from the GW Anchor
+        delta_h = abs(gw_h_mono - pbe_h_mono)
+        delta_l = abs(gw_l_mono - pbe_l_mono)
+        total_delta = delta_h + delta_l
+        
+        f_lumo = delta_l / total_delta if total_delta > 0 else 0.5
+        f_homo = delta_h / total_delta if total_delta > 0 else 0.5
+        
+        # 2. Project Absolute PBE Levels (Bypassing CP2K floating vacuum)
+        # We use the computed intermediate PBE gap (dft_gap) as the physical truth
+        shrinkage_pbe = gap_pbe_mono - dft_gap 
+        
+        true_pbe_homo = pbe_h_mono + (shrinkage_pbe * f_homo)
+        true_pbe_lumo = pbe_l_mono - (shrinkage_pbe * f_lumo)
+        
+        # 3. Apply the Dielectric Scissor to get QP levels
+        qp_homo = true_pbe_homo - (scissor * f_homo)
+        qp_lumo = true_pbe_lumo + (scissor * f_lumo)
+        
+        print(f"\n  [Absolute Band Edges (IP & EA)]")
+        print(f"    Raw CP2K HOMO    : {dft_homo_raw:8.4f} eV (Floating Vacuum)")
+        print(f"    True PBE HOMO    : {true_pbe_homo:8.4f} eV (Anchored to Monomer)")
+        print(f"    -> Shift Split   : HOMO takes {f_homo*100:.1f}%, LUMO takes {f_lumo*100:.1f}%")
 
+    else:
+        # Fallback if no 14-item monomer data is available
+        f_homo, f_lumo = 0.5, 0.5
+        qp_homo = dft_homo_raw - (scissor * f_homo)
+        qp_lumo = dft_lumo_raw + (scissor * f_lumo)
+        
+        print(f"\n  [Absolute Band Edges (IP & EA)]")
+        print(f"    Raw CP2K HOMO    : {dft_homo_raw:8.4f} eV")
+        print(f"    -> Shift Split   : HOMO takes 50.0%, LUMO takes 50.0% (Default)")
+
+    print(f"    QP HOMO (IP)     : {qp_homo:8.4f} eV   -> IP = {-qp_homo:8.4f} eV")
+    print(f"    QP LUMO (EA)     : {qp_lumo:8.4f} eV   -> EA = {-qp_lumo:8.4f} eV")
+    # =========================================================================
+
+    print(f"  -> Energy axis shifted and target gap resolved in {time.time() - t0_gap:.4f} s")
+ 
     # -----------------------------------------------------------------
     # Unified S@C Computation
     # -----------------------------------------------------------------
@@ -622,14 +674,22 @@ def main():
         scissor_ev=scissor, kernel=args.kernel, alpha=args.alpha, beta=args.beta, include_exchange=args.exchange, 
         estimate_qp=args.estimate_qp, material=args.material, e_thresh=args.e_thresh, f_thresh=args.f_thresh,
         mu_ia_x=mu_ia_x, mu_ia_y=mu_ia_y, mu_ia_z=mu_ia_z, eps_out=args.eps_out,
-        soc_U=None, soc_E=None, device=compute_device
+        soc_U=None, soc_E=None, device=compute_device,
+        vxc_ao_path=args.vxc_ao,
+        nthreads=args.nthreads
     )
 
     if args.estimate_qp:
         # Pull the dynamically calculated QP gap correction from the solver
         calculated_gap_shift = solver_sf.ham.sigma_virt[0] - solver_sf.ham.sigma_occ[-1]
-        scissor = calculated_gap_shift
-        # Update confinement energy based on the new total gap
+        
+        if getattr(args, 'use_cohsex_gap', False):
+            print(f"\n  [QP] OVERRIDE: Using Pure COHSEX Gap Correction ({calculated_gap_shift:.4f} eV) instead of Tabulated GW.")
+            scissor = calculated_gap_shift
+        else:
+            print(f"\n  [QP] Note: Tabulated GW Scissor ({scissor:.4f} eV) was used as the anchor. COHSEX provided orbital dispersion.")
+            
+        # Update confinement energy based on the final total gap
         confinement_energy = (dft_gap + scissor) - db_gap
 
     suffix_sf = "_sf" if args.soc_flag else ""
@@ -648,7 +708,9 @@ def main():
             scissor_ev=scissor, kernel=args.kernel, alpha=args.alpha, beta=args.beta, include_exchange=args.exchange, 
             estimate_qp=args.estimate_qp, material=args.material, e_thresh=args.e_thresh, f_thresh=args.f_thresh, 
             mu_ia_x=mu_ia_x, mu_ia_y=mu_ia_y, mu_ia_z=mu_ia_z, eps_out=args.eps_out,
-            soc_U=bse_soc_U, soc_E=bse_soc_E, device=compute_device
+            soc_U=bse_soc_U, soc_E=bse_soc_E, device=compute_device, 
+            vxc_ao_path=args.vxc_ao,
+            nthreads=args.nthreads
         )
  
         run_solver_and_analysis(solver_soc, np.array(coords_ang), syms, shells, mu_ia_x, mu_ia_y, mu_ia_z, 

@@ -481,4 +481,30 @@ def parse_gth_soc_potentials(path, elements_to_parse):
             
     return ecp_dict
 
+def get_vxc_ao_matrix(txt_path, n_ao):
+    """
+    Retrieves the Vxc AO matrix. 
+    Uses a raw .bin cache to instantly load massive arrays on subsequent runs.
+    """
+    import os
+    import numpy as np
+    import libint_cpp
+
+    bin_path = txt_path + ".raw.bin"
+
+    # 1. Try instant binary load via C++
+    if os.path.exists(bin_path):
+        print(f"  [Vxc] Found raw binary cache. Loading instantly via C++...")
+        return libint_cpp.load_raw_binary(bin_path, n_ao)
+
+    # 2. Fallback to C++ text parser
+    print(f"  [Vxc] Cache not found. Parsing text block-matrix with C++ (First time only)...")
+    V_ao = libint_cpp.parse_cp2k_block_matrix(txt_path, n_ao)
+
+    # 3. Save as raw binary for future runs
+    print(f"  [Vxc] Caching raw binary matrix for high-speed future access...")
+    with open(bin_path, "wb") as f:
+        f.write(V_ao.tobytes()) # Zero-overhead raw dump
+        
+    return V_ao
 

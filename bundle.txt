@@ -185,7 +185,7 @@ def load_fuzzy(npz_path):
     d = np.load(npz_path, allow_pickle=True)
     Z = np.asarray(d["intensity"], dtype=float)
     centres = np.asarray(d["centres"], dtype=float)
-    step = int(np.ceil((Z.size / 2_000_000) ** 0.5))
+    step = int(np.ceil((Z.size / 250_000) ** 0.5))
     if step > 1:
         Z = Z[::step, ::step]
         centres = centres[::step]
@@ -247,7 +247,7 @@ def parse_cube(filepath):
     BOHR_TO_ANG = 0.529177249
     origin *= BOHR_TO_ANG
     dx *= BOHR_TO_ANG; dy *= BOHR_TO_ANG; dz *= BOHR_TO_ANG
-    step_x = max(1, nx // 40); step_y = max(1, ny // 40); step_z = max(1, nz // 40)
+    step_x = max(1, nx // 20); step_y = max(1, ny // 20); step_z = max(1, nz // 20)
     V = V[::step_x, ::step_y, ::step_z]
     nx_new, ny_new, nz_new = V.shape
     x = origin[0] + np.arange(nx_new) * (dx * step_x)
@@ -299,20 +299,26 @@ def generate_interactive_plot(prefix="sf", material="DEFAULT", ef=0.0, e_homo=No
     Zm = Z.astype(np.float32); Zm[Zm <= 0] = np.nan
     
     fig.add_shape(type="rect", xref="x", yref="y", x0=kx[0], x1=kx[-1], y0=ewin[0], y1=ewin[1], fillcolor="black", line=dict(width=0), layer="below") 
+
     heat = go.Heatmap(
         z=np.log10(Zm), x=kx, y=fuzzy["centres"], colorscale="Inferno",
         zmin=float(np.log10(vmin_base)), zmax=float(np.log10(vmax)), showscale=True,
+        zsmooth="best",  # <--- ADD THIS EXACT LINE
         colorbar=dict(title=dict(text="<b>log₁₀(I)</b>", font=dict(size=20)), orientation="h", len=0.30, thickness=20, x=0.17, xanchor="center", y=1.08, yanchor="bottom", tickfont=dict(size=18)),
         hovertemplate="k=%{x:.3f} Å⁻¹<br>E=%{y:.3f} eV<br>log10(I)=%{z:.2f}<extra></extra>"
     )
+
     fig.add_trace(heat, row=1, col=1)
-    
+   
     if fuzzy["tick_positions"].size:
-        scale = (kx[-1] - kx[0]) / (Z.shape[1] - 1)
+        # FIX: Scale ticks based on the original physical width, not the downsampled pixel count
+        original_width = fuzzy["extent"][1] - fuzzy["extent"][0]
+        scale = (kx[-1] - kx[0]) / original_width if original_width > 0 else 1.0
         tpos_plot = kx[0] + fuzzy["tick_positions"] * scale
+        
         for x in tpos_plot: fig.add_vline(x=x, line_color="rgba(255,255,255,0.4)", line_width=2, row=1, col=1)
         fig.update_xaxes(tickmode="array", tickvals=tpos_plot, ticktext=fuzzy["tick_labels"], row=1, col=1)
-
+ 
     if len(pdos_L) > 0:
         for j, lab in enumerate(pdos_L):
             fig.add_trace(go.Scatter(x=pdos_Y[:, j], y=pdos_E, mode="lines", fill="tonextx" if j > 0 else "tozerox", line=dict(width=1.0, color="rgba(0,0,0,0)"), fillcolor=palette[j % len(palette)], name=lab, showlegend=True, legend="legend", hovertemplate=f"{lab}: %{{x:.3f}}<br>E=%{{y:.3f}} eV<extra></extra>"), row=1, col=2)
@@ -389,11 +395,21 @@ def generate_interactive_plot(prefix="sf", material="DEFAULT", ef=0.0, e_homo=No
     if prefix == "soc":
         cube_files = [f for f in os.listdir('.') if f.lower().startswith('spinor_') and f.lower().endswith('.cube')]
     else:
-        cube_files = [f for f in os.listdir('.') if f.lower().startswith('mo_') and f.lower().endswith('.cube')]
-    
+        cube_files = [f for f in os.listdir('.') if f.lower().startswith('spatial_') and f.lower().endswith('.cube')]
+
     def extract_idx(name):
+        name = name.upper()
+        if "HOMO" in name:
+            match = re.search(r'HOMO-(\d+)', name)
+            return -int(match.group(1)) if match else 0
+        elif "LUMO" in name:
+            match = re.search(r'LUMO\+(\d+)', name)
+            return 1 + (int(match.group(1)) if match else 0)
+            
+        # Fallback for other numbered files
         match = re.search(r'\d+', name)
         return int(match.group()) if match else 0
+    
     cube_files.sort(key=extract_idx)
     
     plot_3d_html = ""
@@ -426,7 +442,6 @@ def generate_interactive_plot(prefix="sf", material="DEFAULT", ef=0.0, e_homo=No
                 iso_val = 0.0001
                 iso_pos = min(iso_val, v_max * 0.95)
                 if iso_pos < 1e-6: iso_pos = v_max * 0.50
-                
                 fig_3d.add_trace(go.Isosurface(
                     x=X_grid, y=Y_grid, z=Z_grid, value=V_data,
                     isomin=iso_pos, isomax=iso_pos, surface_count=1,
@@ -443,7 +458,8 @@ def generate_interactive_plot(prefix="sf", material="DEFAULT", ef=0.0, e_homo=No
                         x=X_grid, y=Y_grid, z=Z_grid, value=V_data,
                         isomin=iso_pos, isomax=iso_pos, surface_count=1,
                         colorscale=[[0, 'blue'], [1, 'blue']], showscale=False,
-                        caps=dict(x_show=False, y_show=False, z_show=False), opacity=0.5, name="Pos Lobe"
+                        caps=dict(x_show=False, y_show=False, z_show=False), opacity=0.35, name="Pos Lobe",
+                        flatshading=False,
                     ), row=1, col=idx+1)
                 
                 if iso_neg < -1e-6:
@@ -451,7 +467,8 @@ def generate_interactive_plot(prefix="sf", material="DEFAULT", ef=0.0, e_homo=No
                         x=X_grid, y=Y_grid, z=Z_grid, value=V_data,
                         isomin=iso_neg, isomax=iso_neg, surface_count=1,
                         colorscale=[[0, 'red'], [1, 'red']], showscale=False,
-                        caps=dict(x_show=False, y_show=False, z_show=False), opacity=0.5, name="Neg Lobe"
+                        caps=dict(x_show=False, y_show=False, z_show=False), opacity=0.35, name="Neg Lobe",
+                        flatshading=False,
                     ), row=1, col=idx+1)
                     
             if idx == 0: first_iso_val = iso_val
@@ -498,7 +515,7 @@ def generate_interactive_plot(prefix="sf", material="DEFAULT", ef=0.0, e_homo=No
             .explanation-box h2 {{ margin-top: 0; color: #222; font-size: 26px; border-bottom: 2px solid #eee; padding-bottom: 10px; margin-bottom: 20px; }}
             .glossary-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 25px; }}
             .glossary-item {{ background: #fff; padding: 20px; border-radius: 6px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); border-left: 4px solid #1f77b4; }}
-            .glossary-item strong {{ display: block; font-size: 20px; margin-bottom: 10px; color: #111; }}
+            .glossary-item > strong {{ display: block; font-size: 20px; margin-bottom: 10px; color: #111; }}
             .glossary-item p {{ margin: 0; font-size: 16px; line-height: 1.5; color: #555; }}
             .trap-indicator {{ border-left-color: #ff7f0e; }}
             .cube-indicator {{ border-left-color: #d62728; }}
@@ -575,7 +592,7 @@ def generate_interactive_plot(prefix="sf", material="DEFAULT", ef=0.0, e_homo=No
     </html>
     """
     
-    out_html = f"fuzzy_dashboard_{material}_{prefix}.html"
+    out_html = f"fuzzy_dashboard_{prefix}.html"
     with open(out_html, 'w', encoding='utf-8') as f:
         f.write(html_template)
         
@@ -600,7 +617,8 @@ class ExcitonSolver:
                  homo_index, n_occ, n_virt, scissor_ev, kernel, alpha, beta=0.0, material=None, 
                  include_exchange=False, estimate_qp=False, e_thresh=None, f_thresh=0.0, 
                  mu_ia_x=None, mu_ia_y=None, mu_ia_z=None, eps_out=2.0, 
-                 soc_U=None, soc_E=None, device="numpy", precomputed_sigma=None): 
+                 soc_U=None, soc_E=None, device="numpy", precomputed_sigma=None, 
+                 vxc_ao_path=None, nthreads=1):
 
         self.C = C
         self.overlap = overlap
@@ -635,15 +653,16 @@ class ExcitonSolver:
         self.ham = ExcitonHamiltonian(
             C=C, eps=eps, overlap=overlap, atom_ao_ranges=atom_ao_ranges,
             homo_index=homo_index, n_occ=n_occ, n_virt=n_virt, scissor_ev=scissor_ev,
-            gamma_qp=gamma_qp,        # NEW
-            gamma_bse=gamma_bse,      # NEW
+            gamma_qp=gamma_qp,        
+            gamma_bse=gamma_bse,      
             material=material,
             gamma_bare=gamma_bare,
             gamma_penalty=gamma_penalty,
             alpha=alpha,            
             include_exchange=include_exchange, estimate_qp=estimate_qp, e_thresh=e_thresh, 
             f_thresh=f_thresh, mu_ia_x=mu_ia_x, mu_ia_y=mu_ia_y, mu_ia_z=mu_ia_z, 
-            soc_U=soc_U, soc_E=soc_E, device=device, precomputed_sigma=precomputed_sigma # <--- ADDED
+            soc_U=soc_U, soc_E=soc_E, device=device, precomputed_sigma=precomputed_sigma,
+            vxc_ao_path=vxc_ao_path, nthreads=nthreads
         )
 
     def solve(self, nroots=10, full_diag=False, tol=1e-5):
@@ -1326,11 +1345,13 @@ FILE: miniBSE/exciton_hamiltonian.py
 import numpy as np
 import time
 import sys
+from miniBSE.io_utils import get_vxc_ao_matrix
 
 class ExcitonHamiltonian:
     def __init__(self, C, eps, overlap, atom_ao_ranges, homo_index, n_occ, n_virt, scissor_ev, gamma_qp, gamma_bse, material=None, 
                  gamma_bare=None, gamma_penalty=None, alpha=1.0, include_exchange=False, estimate_qp=False, e_thresh=None, f_thresh=0.0, mu_ia_x=None, mu_ia_y=None, mu_ia_z=None, 
-                 charge_type='mulliken', soc_U=None, soc_E=None, device="numpy", precomputed_sigma=None):
+                 charge_type='mulliken', soc_U=None, soc_E=None, device="numpy", precomputed_sigma=None,
+                 vxc_ao_path=None, nthreads=1):
         
         self.include_exchange = include_exchange
         self.estimate_qp = estimate_qp
@@ -1453,7 +1474,7 @@ class ExcitonHamiltonian:
                     sex = 0.0
                     for j in range(n_valence_occ):
                         q_ij = q_act_occ_val[i, j, :]
-                        sex -= np.dot(q_ij, self.gamma_bare @ q_ij)
+                        sex -= np.dot(q_ij, W @ q_ij)
                     
                     # Apply the isolated Hubbard penalty (Push occupied DOWN)
                     sic = np.dot(q_ii, self.gamma_penalty @ q_ii) if self.gamma_penalty is not None else 0.0
@@ -1499,13 +1520,55 @@ class ExcitonHamiltonian:
                 print(f"       HOMO Top 5 Atom Charges (q): {q_homo[top_homo_atoms]}")
                 print(f"       LUMO Top 5 Atom Charges (q): {q_lumo[top_lumo_atoms]}")
                 # -----------------------------------
-    
-                # 3. Vxc Cancellation (HOMO Referencing)
-                homo_raw_shift = sigma_occ_raw[-1]
-                self.sigma_occ = sigma_occ_raw - homo_raw_shift
-                self.sigma_virt = sigma_virt_raw - homo_raw_shift 
-                
-                print(f"       Calculated Gap Correction: {(self.sigma_virt[0] - self.sigma_occ[-1]):+8.4f} eV")
+                # 3. Exact Vxc Correction from AO Matrix OR HOMO Referencing
+                import os
+                if vxc_ao_path is not None and os.path.exists(vxc_ao_path):
+                    print("\n  [Vxc] Applying Exact State-Dependent Vxc Integrals...")
+                    V_ao = get_vxc_ao_matrix(vxc_ao_path, self.overlap.shape[0])
+                    
+                    vxc_occ = np.zeros(self.n_occ_act)
+                    for i in range(self.n_occ_act):
+                        c_i = self.C_orig_occ[:, i]
+                        vxc_occ[i] = c_i.T @ V_ao @ c_i
+                    
+                    vxc_virt = np.zeros(self.n_virt_act)
+                    for a in range(self.n_virt_act):
+                        c_a = self.C_orig_virt[:, a]
+                        vxc_virt[a] = c_a.T @ V_ao @ c_a
+
+                    HA_TO_EV = 27.211386
+                    vxc_occ_ev = vxc_occ * HA_TO_EV
+                    vxc_virt_ev = vxc_virt * HA_TO_EV
+
+                    print(f"       HOMO Exact Vxc: {vxc_occ_ev[-1]:8.4f} eV")
+                    print(f"       LUMO Exact Vxc: {vxc_virt_ev[0]:8.4f} eV")
+                    
+                    # Apply Exact State-Dependent G0W0 Equation
+                    self.sigma_occ = sigma_occ_raw - vxc_occ_ev
+                    self.sigma_virt = sigma_virt_raw - vxc_virt_ev
+                    
+                    cohsex_gap_corr = self.sigma_virt[0] - self.sigma_occ[-1]
+                    print(f"       Exact Vxc Gap Correction: {cohsex_gap_corr:+8.4f} eV")
+
+                else:
+                    # Fallback to standard HOMO-referencing
+                    if vxc_ao_path is not None:
+                        print(f"\n  [Vxc] WARNING: '{vxc_ao_path}' not found! Falling back to HOMO-referencing.")
+                        
+                    homo_raw_shift = sigma_occ_raw[-1]
+                    self.sigma_occ = sigma_occ_raw - homo_raw_shift
+                    self.sigma_virt = sigma_virt_raw - homo_raw_shift 
+                    
+                    cohsex_gap_corr = self.sigma_virt[0] - self.sigma_occ[-1]
+                    print(f"       Pure COHSEX Gap Correction: {cohsex_gap_corr:+8.4f} eV")
+ 
+                # 4. HYBRID GW APPROACH: Anchor to Tabulated GW Scissor
+                if scissor_ev != 0.0:
+                    print(f"       Tabulated GW Target Shift : {scissor_ev:+8.4f} eV")
+                    residual_shift = scissor_ev - cohsex_gap_corr
+                    self.sigma_virt += residual_shift
+                    print(f"       -> Applied residual shift of {residual_shift:+8.4f} eV to virtuals to match Tabulated GW Gap.")
+                    
                 print(f"    Completed in {time.time() - t_qp:2.4f} s")
         else:
             # --- MANUAL SCISSOR MODE ---
@@ -1915,43 +1978,53 @@ HARDNESS_DICT = {
     'lr': 5.4607
 }
 
+# =====================================================================
+# MATERIAL DATABASE (2026 BENCHMARKS)
+# =====================================================================
+# Updated Format: (eps_inf, Bohr_diam_A, lattice_A, gap_exp_eV, eps_static, m_eff, E_LO_eV, 
+#                  gap_pbe_scalar_eV, gap_gw_scalar_eV, 
+#                  R_mono_A, gap_pbe_mono_eV, gap_gw_mono_eV)
+# Note: PBE and GW gaps are SCALAR RELATIVISTIC (No SOC).
+# Bulk values are taken from the literature. Monomer values are computed with cp2k : DZVP-RI/GTH/PBE then GW
+# Monomer values are computed using PBE0 + GW for the scissor to correct the PBE DFT gap in the second last column. 
+# The R0 monomer is computed using convex hull on the relaxed structure
+# Inverted gap systems (InAs, InSb, HgSe, HgTe) use negative PBE values to ensure correct scissor scaling.
+
 MATERIAL_DB = {
-# (eps_inf, Bohr_diam_A, lattice_A, gap_exp_eV, eps_static, m_eff, E_LO_eV, gap_pbe_scalar_eV, gap_gw_scalar_eV)
+    # Halide Perovskites (Cubic Phase Benchmarks)
+    "CSPBCL3": (4.0, 25.0, 5.60, 3.00, 20.0, 0.15, 0.022, 2.45, 3.65),
+    "CSPBBR3": (4.8, 35.0, 5.83, 2.30, 25.0, 0.12, 0.018, 1.85, 2.85),
+    "CSPBI3":  (5.1, 60.0, 6.20, 1.73, 30.0, 0.10, 0.015, 1.55, 2.45),
+    "MAPBI3":  (6.5, 45.0, 6.27, 1.55, 30.0, 0.10, 0.015, 1.55, 2.50),
+    "FAPBI3":  (6.2, 50.0, 6.36, 1.48, 28.0, 0.10, 0.015, 1.45, 2.35),
 
-# Halide Perovskites
-"CSPBCL3": (4.0, 25.0, 5.60, 3.00, 20.0, 0.15, 0.022, 2.35, 3.50),
-"CSPBBR3": (4.8, 35.0, 5.83, 2.30, 25.0, 0.12, 0.018, 1.65, 2.65),
-"CSPBI3":  (5.1, 60.0, 6.20, 1.73, 30.0, 0.10, 0.015, 1.35, 2.15),
-"MAPBI3":  (6.5, 45.0, 6.27, 1.55, 30.0, 0.10, 0.015, 1.55, 2.40),
-"FAPBI3":  (6.2, 50.0, 6.36, 1.48, 28.0, 0.10, 0.015, 1.45, 2.30),
+    # II–VI Semiconductors
+    "ZNS":  (5.1, 25.0, 5.41, 3.60, 8.9, 0.28, 0.043, 2.11, 3.73), #
+    "ZNSE": (5.9, 38.0, 5.67, 2.70, 8.6, 0.17, 0.031, 1.25, 2.76), #
+    "ZNTE": (6.7, 52.0, 6.10, 2.26, 9.8, 0.12, 0.026, 1.18, 2.35), #
+    "CDS":  (5.4, 30.0, 5.82, 2.42, 8.9, 0.16, 0.037, 1.14, 2.55), #
+    "CDSE": (6.2, 56.0, 6.05, 1.74, 9.5, 0.13, 0.026, 0.64, 1.91,  5.255, 2.64, 5.95), #
+    "CDTE": (7.1, 73.0, 6.48, 1.44, 10.2, 0.10, 0.021, 0.61, 1.62), #
+    "HGS":  (11.3, 50.0, 5.85, 0.50, 13.0, 0.20, 0.030, 0.00, 0.50),
+    "HGSE": (14.0, 460.0, 6.08, 0.00, 18.0, 0.04, 0.017, -0.42, 0.12), #
+    "HGTE": (15.0, 400.0, 6.46, 0.00, 20.0, 0.03, 0.015, -0.61, 0.10, 1.536, 0.00, 5.312), #
 
-# II–VI Semiconductors
-"ZNS":  (5.1, 25.0, 5.41, 3.60, 8.9, 0.28, 0.043, 2.10, 3.70),
-"ZNSE": (5.9, 38.0, 5.67, 2.70, 8.6, 0.17, 0.031, 1.20, 2.70),
-"ZNTE": (6.7, 52.0, 6.10, 2.26, 9.8, 0.12, 0.026, 1.05, 2.35),
-"CDS":  (5.4, 30.0, 5.82, 2.42, 8.9, 0.16, 0.037, 1.15, 2.50),
-"CDSE": (6.2, 56.0, 6.05, 1.74, 9.5, 0.13, 0.026, 0.60, 1.80),
-"CDTE": (7.1, 73.0, 6.48, 1.44, 10.2, 0.10, 0.021, 0.55, 1.60),
-"HGS":  (11.3, 50.0, 5.85, 0.50, 13.0, 0.20, 0.030, 0.00, 0.50),
-"HGSE": (14.0, 460.0, 6.08, 0.00, 18.0, 0.04, 0.017, -0.40, 0.10),
-"HGTE": (15.0, 400.0, 6.46, 0.00, 20.0, 0.03, 0.015, -0.60, 0.10),
+    # III–V Semiconductors
+    "ALP":  (7.5, 15.0, 5.46, 2.45, 10.0, 0.20, 0.050, 1.59, 2.44), #
+    "ALAS": (8.2, 30.0, 5.66, 2.16, 10.1, 0.15, 0.049, 1.39, 2.15), #
+    "ALSB": (10.2, 60.0, 6.14, 1.62, 12.0, 0.14, 0.036, 1.18, 1.83),
+    "GAP":  (9.1, 15.0, 5.45, 2.26, 11.1, 0.15, 0.049, 1.61, 2.36),
+    "GAAS": (10.9, 100.0, 5.65, 1.42, 13.1, 0.067, 0.036, 0.49, 1.42), #
+    "GASB": (14.4, 200.0, 6.10, 0.73, 15.7, 0.04, 0.028, 0.11, 0.77),
+    "INP":  (9.6, 150.0, 5.87, 1.34, 12.4, 0.08, 0.042, 0.46, 1.44), #
+    "INAS": (11.8, 340.0, 6.06, 0.35, 15.0, 0.023, 0.029, -0.42, 0.35, 1.536, -0.21, 4.536), #
+    "INSB": (15.7, 650.0, 6.48, 0.17, 17.9, 0.014, 0.023, -0.61, 0.23), #
 
-# III–V Semiconductors
-"ALP":  (7.5, 15.0, 5.46, 2.45, 10.0, 0.20, 0.050, 1.55, 2.50),
-"ALAS": (8.2, 30.0, 5.66, 2.16, 10.1, 0.15, 0.049, 1.35, 2.20),
-"ALSB": (10.2, 60.0, 6.14, 1.62, 12.0, 0.14, 0.036, 1.00, 1.65),
-"GAP":  (9.1, 15.0, 5.45, 2.26, 11.1, 0.15, 0.049, 1.55, 2.40),
-"GAAS": (10.9, 100.0, 5.65, 1.42, 13.1, 0.067, 0.036, 0.55, 1.40),
-"GASB": (14.4, 200.0, 6.10, 0.73, 15.7, 0.04, 0.028, 0.10, 0.80),
-"INP":  (9.6, 150.0, 5.87, 1.34, 12.4, 0.08, 0.042, 0.55, 1.40),
-"INAS": (11.8, 340.0, 6.06, 0.35, 15.0, 0.023, 0.029, -0.15, 0.65),
-"INSB": (15.7, 650.0, 6.48, 0.17, 17.9, 0.014, 0.023, -0.30, 0.35),
+    # IV–VI Semiconductors
+    "PBS":  (17.2, 200.0, 5.94, 0.41, 23.0, 0.09, 0.027, 0.15, 0.65), #
+    "PBSE": (22.9, 460.0, 6.12, 0.27, 30.0, 0.07, 0.017, 0.05, 0.55), #
 
-# IV–VI Semiconductors
-"PBS":  (17.2, 200.0, 5.94, 0.41, 23.0, 0.09, 0.027, 0.15, 0.60),
-"PBSE": (22.9, 460.0, 6.12, 0.27, 30.0, 0.07, 0.017, 0.05, 0.45),
-
-"DEFAULT": (1.0, 1.0, 5.0, 0.0, 1.0, 1.0, 0.02, 0.00, 0.00)
+    "DEFAULT": (1.0, 1.0, 5.0, 0.0, 1.0, 1.0, 0.02, 0.00, 0.00)
 }
 
 # Core inorganic elements for each material (ignores organic ligands like MA/FA)
@@ -1967,11 +2040,11 @@ MATERIAL_ELEMENTS = {
     "PBS":     ["Pb", "S"], "PBSE":    ["Pb", "Se"]
 }
 
-# --- Add this function to the bottom of hardness.py ---
 def estimate_gw_qp_gap(coords, atom_symbols, material_name, eps_out):
     """
-    Computes the parameter-free Quasiparticle Scissor using tabulated bulk GW data
-    and scaling it dynamically for dielectric confinement via surface polarization.
+    Computes the parameter-free Quasiparticle Scissor using tabulated bulk GW data.
+    Uses an exact monomer GW limit (vacuum) to prevent 1/R divergence at ultrasmall sizes,
+    then applies the true solvent dielectric environment (eps_out) to the dampened geometry.
     """
     if material_name is None:
         print("  [Warning] Material not specified. Cannot compute GW scaling.")
@@ -1987,34 +2060,68 @@ def estimate_gw_qp_gap(coords, atom_symbols, material_name, eps_out):
         print(f"  [Warning] MATERIAL_DB entry for {m_name} is outdated. GW estimation failed.")
         return None
         
+    # Extract Bulk Data
     eps_inf = entry[0]
-    gap_pbe_scalar = entry[7]
-    gap_gw_scalar = entry[8]
+    gap_pbe_bulk = entry[7]
+    gap_gw_bulk = entry[8]
     
-    if gap_gw_scalar == 0.0:
+    if gap_gw_bulk == 0.0:
         print(f"  [Warning] Missing GW bulk gap for {m_name}. GW estimation failed.")
         return None
         
+    # Extract Monomer Data (if available in the tuple)
+    has_monomer_data = len(entry) >= 12
+    R_mono, gap_pbe_mono, gap_gw_mono = 0.0, 0.0, 0.0
+    if has_monomer_data:
+        R_mono = entry[9]
+        gap_pbe_mono = entry[10]
+        gap_gw_mono = entry[11]
+        
+    # Get physical size of the cluster
     metrics = get_cluster_size_metrics(coords, atom_symbols, material_name)
     R_QD_ang = metrics['R_eff_hull']
     
-    # 1. Bulk GW Correction (Many-Body Shift fixing the DFT Error)
-    delta_bulk_qp = gap_gw_scalar - gap_pbe_scalar
-    
-    # 2. Size-dependent Surface Polarization (Dielectric Confinement)
-    # Formula: Sigma_pol = (14.4 * 0.8 / R_QD) * (1/eps_out - 1/eps_inf)
-    sigma_pol = (11.52 / R_QD_ang) * ((1.0 / eps_out) - (1.0 / eps_inf))
-    
-    # Total Scissor to apply to the raw DFT virtual states
-    total_scissor = delta_bulk_qp + sigma_pol
+    # --- 1. Bulk GW Correction (Infinite Limit) ---
+    delta_bulk_qp = gap_gw_bulk - gap_pbe_bulk
     
     print(f"\n  [Scaled GW Model] Quasiparticle Correction for {m_name}:")
-    print(f"    Cluster Radius (R_QD) : {R_QD_ang:.2f} Å")
-    print(f"    Bulk PBE Gap          : {gap_pbe_scalar:.3f} eV")
-    print(f"    Bulk GW Gap           : {gap_gw_scalar:.3f} eV")
+    print(f"    Cluster Radius (R_QD) : {R_QD_ang:.3f} Å")
+    print(f"    Bulk PBE Gap          : {gap_pbe_bulk:.3f} eV")
+    print(f"    Bulk GW Gap           : {gap_gw_bulk:.3f} eV")
     print(f"    -> Bulk Shift         : {delta_bulk_qp:+.3f} eV")
-    print(f"    -> Polarization Shift : {sigma_pol:+.3f} eV  (eps_out={eps_out}, eps_inf={eps_inf})")
-    print(f"    ==> Total GW Scissor  : {total_scissor:+.3f} eV")
+    
+    # --- 2. Vacuum Monomer Anchor (Geometric Damping) ---
+    gamma = 0.0
+    if has_monomer_data and gap_gw_mono > 0:
+        # Kappa in pure vacuum (eps_out = 1.0)
+        kappa_vac = 11.52 * (1.0 - (1.0 / eps_inf))
+        
+        # Maximum physical shift at the monomer limit in vacuum
+        sigma_max_vac = (gap_gw_mono - gap_pbe_mono) - delta_bulk_qp
+        
+        # Calculate gamma, protecting against unphysical negative damping
+        if sigma_max_vac > 0.0:
+            gamma = max(0.0, (kappa_vac / sigma_max_vac) - R_mono)
+            print(f"    Monomer Anchor (Vac)  : R={R_mono:.2f} Å, dE_max={sigma_max_vac:.3f} eV")
+            print(f"    -> Geometric Damping  : γ = {gamma:.3f} Å")
+        else:
+            print("    -> Geometric Damping  : γ = 0.000 Å (Anomalous Monomer Data)")
+    else:
+        print("    -> Geometric Damping  : γ = 0.000 Å (Using standard 1/R without monomer data)")
+        
+    # --- 3. Solvent-Screened Surface Polarization ---
+    # Now use the user's actual solvent (eps_out)
+    kappa_solvent = 11.52 * ((1.0 / eps_out) - (1.0 / eps_inf))
+    
+    # Apply the solvent kappa to the structurally dampened radius
+    sigma_pol = kappa_solvent / (R_QD_ang + gamma)
+    
+    print(f"    Solvent Dielectric    : eps_out = {eps_out:.2f}, eps_inf = {eps_inf:.2f}")
+    print(f"    -> Polarization Shift : {sigma_pol:+.3f} eV")
+    
+    # --- 4. Total Quasiparticle Scissor ---
+    total_scissor = delta_bulk_qp + sigma_pol
+    print(f"    ==> Total GW Scissor  : {total_scissor:+.3f} eV\n")
     
     return total_scissor
 
@@ -2042,12 +2149,12 @@ def compute_delta_xc(material):
     return max(delta_xc, 0.0)
 
 def get_cluster_size_metrics(coords_ang, atom_symbols=None, material_name=None):
-    """Robust, rotation-invariant size metrics for nanoclusters/QDs (Angstrom)."""
+    """Calculates size using Axis-Aligned Bounding Box (ideal for lattice-cut QDs)."""
     coords = np.asarray(coords_ang, dtype=float)
 
     if atom_symbols is not None and material_name is not None:
         m_name = material_name.upper()
-        if m_name in MATERIAL_ELEMENTS:
+        if 'MATERIAL_ELEMENTS' in globals() and m_name in MATERIAL_ELEMENTS:
             core_elements = [el.lower() for el in MATERIAL_ELEMENTS[m_name]]
             core_coords = [coords[i] for i, sym in enumerate(atom_symbols) if sym.lower() in core_elements]
             if len(core_coords) > 0:
@@ -2056,18 +2163,17 @@ def get_cluster_size_metrics(coords_ang, atom_symbols=None, material_name=None):
     if len(coords) < 2:
         return {'R_eff_hull': 1.0, 'diameter_hull': 2.0}
 
-    com = np.mean(coords, axis=0)
-    r_vec = coords - com
-    Rg = np.sqrt(np.mean(np.sum(r_vec**2, axis=1)))
-    R_eff_gyr = Rg * np.sqrt(5.0 / 3.0)
+    # Blazing fast: Calculate peak-to-peak distance directly along X, Y, and Z axes
+    spans = np.ptp(coords, axis=0)
 
-    try:
-        hull = ConvexHull(coords, qhull_options='QJ')
-        R_eff_hull = (3.0 * hull.volume / (4.0 * np.pi)) ** (1.0 / 3.0)
-    except Exception:
-        R_eff_hull = R_eff_gyr
+    # Add 2.5 Å for the physical outer electron cloud (van der Waals radii)
+    spans += 2.5
 
-    return {'R_eff_hull': R_eff_hull, 'diameter_hull': 2.0 * R_eff_hull}
+    # The effective diameter is the average of length, width, and height
+    avg_diameter = np.mean(spans)
+    R_eff = avg_diameter / 2.0
+
+    return {'R_eff_hull': float(R_eff), 'diameter_hull': float(avg_diameter)}
 
 # =====================================================================
 # Model 1: Classic MNOK Kernel (sTDA style)
@@ -2736,6 +2842,8 @@ def main():
     parser.add_argument("--beta", type=float, default=0.0, help="Exact exchange fraction [0.0 to 1.0] for Hubbard U stiffening on the QP bare kernel.")
     parser.add_argument("--exchange", action="store_true")
     parser.add_argument("--estimate_qp", action="store_true", help="Compute G0W0-lite Quasiparticle corrections via COHSEX")
+    parser.add_argument("--use_cohsex_gap", action="store_true", help="Override the tabulated GW gap with the pure COHSEX computed gap")
+    parser.add_argument("--vxc_ao", type=str, default=None, help="Path to cleaned CP2K AO-basis Vxc matrix text file")
     parser.add_argument("--material", type=str, default="DEFAULT")
     parser.add_argument("--eps-out", type=float, default=2.0)
 
@@ -3093,14 +3201,22 @@ def main():
         scissor_ev=scissor, kernel=args.kernel, alpha=args.alpha, beta=args.beta, include_exchange=args.exchange, 
         estimate_qp=args.estimate_qp, material=args.material, e_thresh=args.e_thresh, f_thresh=args.f_thresh,
         mu_ia_x=mu_ia_x, mu_ia_y=mu_ia_y, mu_ia_z=mu_ia_z, eps_out=args.eps_out,
-        soc_U=None, soc_E=None, device=compute_device
+        soc_U=None, soc_E=None, device=compute_device,
+        vxc_ao_path=args.vxc_ao,
+        nthreads=args.nthreads
     )
 
     if args.estimate_qp:
         # Pull the dynamically calculated QP gap correction from the solver
         calculated_gap_shift = solver_sf.ham.sigma_virt[0] - solver_sf.ham.sigma_occ[-1]
-        scissor = calculated_gap_shift
-        # Update confinement energy based on the new total gap
+        
+        if getattr(args, 'use_cohsex_gap', False):
+            print(f"\n  [QP] OVERRIDE: Using Pure COHSEX Gap Correction ({calculated_gap_shift:.4f} eV) instead of Tabulated GW.")
+            scissor = calculated_gap_shift
+        else:
+            print(f"\n  [QP] Note: Tabulated GW Scissor ({scissor:.4f} eV) was used as the anchor. COHSEX provided orbital dispersion.")
+            
+        # Update confinement energy based on the final total gap
         confinement_energy = (dft_gap + scissor) - db_gap
 
     suffix_sf = "_sf" if args.soc_flag else ""
@@ -3119,7 +3235,9 @@ def main():
             scissor_ev=scissor, kernel=args.kernel, alpha=args.alpha, beta=args.beta, include_exchange=args.exchange, 
             estimate_qp=args.estimate_qp, material=args.material, e_thresh=args.e_thresh, f_thresh=args.f_thresh, 
             mu_ia_x=mu_ia_x, mu_ia_y=mu_ia_y, mu_ia_z=mu_ia_z, eps_out=args.eps_out,
-            soc_U=bse_soc_U, soc_E=bse_soc_E, device=compute_device
+            soc_U=bse_soc_U, soc_E=bse_soc_E, device=compute_device, 
+            vxc_ao_path=args.vxc_ao,
+            nthreads=args.nthreads
         )
  
         run_solver_and_analysis(solver_soc, np.array(coords_ang), syms, shells, mu_ia_x, mu_ia_y, mu_ia_z, 
@@ -3705,6 +3823,32 @@ def parse_gth_soc_potentials(path, elements_to_parse):
             
     return ecp_dict
 
+def get_vxc_ao_matrix(txt_path, n_ao):
+    """
+    Retrieves the Vxc AO matrix. 
+    Uses a raw .bin cache to instantly load massive arrays on subsequent runs.
+    """
+    import os
+    import numpy as np
+    import libint_cpp
+
+    bin_path = txt_path + ".raw.bin"
+
+    # 1. Try instant binary load via C++
+    if os.path.exists(bin_path):
+        print(f"  [Vxc] Found raw binary cache. Loading instantly via C++...")
+        return libint_cpp.load_raw_binary(bin_path, n_ao)
+
+    # 2. Fallback to C++ text parser
+    print(f"  [Vxc] Cache not found. Parsing text block-matrix with C++ (First time only)...")
+    V_ao = libint_cpp.parse_cp2k_block_matrix(txt_path, n_ao)
+
+    # 3. Save as raw binary for future runs
+    print(f"  [Vxc] Caching raw binary matrix for high-speed future access...")
+    with open(bin_path, "wb") as f:
+        f.write(V_ao.tobytes()) # Zero-overhead raw dump
+        
+    return V_ao
 
 
 
@@ -3713,6 +3857,7 @@ FILE: miniBSE/integrals.py
 ==================================================
 
 import numpy as np
+import time
 import libint_cpp
 
 def compute_dipole_ao(shells, origin=None, nthreads=1):
@@ -3725,6 +3870,7 @@ def compute_dipole_ao(shells, origin=None, nthreads=1):
     # libint_cpp.dipole returns a (3, nbf, nbf) numpy array
     mu_ao = libint_cpp.dipole(shells, origin, nthreads)
     return mu_ao[0], mu_ao[1], mu_ao[2]
+
 
 
 
@@ -5399,10 +5545,15 @@ FILE: libint/cp2k_parser.hpp
 
 #pragma once
 #include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
 #include <string>
 
 // Declare the parsing function so bindings.cpp can see it
 pybind11::tuple parse_cp2k_mos_cpp(const std::string& filename, int n_ao_total);
+
+pybind11::array_t<double> parse_cp2k_block_matrix_cpp(const std::string& filename, int n_ao);
+
+pybind11::array_t<double> load_raw_binary_matrix_cpp(const std::string& bin_path, int n_ao);
 
 
 
@@ -5429,8 +5580,14 @@ FILE: libint/cp2k_parser.cpp
 
 #include "cp2k_parser.hpp"
 #include <pybind11/numpy.h>
+#include <iostream>
 #include <fstream>
 #include <vector>
+#include <string>
+#include <sstream>
+#include <fcntl.h>
+#include <unistd.h>
+#include <pybind11/pybind11.h>
 #include <cctype>
 #include <stdexcept>
 #include <thread>
@@ -5647,6 +5804,76 @@ py::tuple parse_cp2k_mos_cpp(const std::string& filename, int n_ao_total) {
 
     return py::make_tuple(C_np, eps_np, occ_np);
 }
+
+// 1. Fast State-Machine Parser for CP2K Block-Dense Text
+py::array_t<double> parse_cp2k_block_matrix_cpp(const std::string& filename, int n_ao) {
+    std::ifstream file(filename);
+    if (!file.is_open()) throw std::runtime_error("C++ Error: Could not open cleaned VXC file.");
+
+    auto result_np = py::array_t<double>({n_ao, n_ao});
+    double* ptr = result_np.mutable_data();
+    std::fill(ptr, ptr + (size_t)n_ao * n_ao, 0.0);
+
+    std::string line;
+    std::vector<int> current_cols;
+
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+
+        std::stringstream ss(line);
+        std::vector<std::string> tokens;
+        std::string buf;
+        while (ss >> buf) tokens.push_back(buf);
+
+        if (tokens.empty()) continue;
+
+        // Header lines are only numbers. Data lines have strings (e.g. "Cd", "2s")
+        bool is_header = true;
+        for (const auto& t : tokens) {
+            if (t.find_first_not_of("0123456789") != std::string::npos) {
+                is_header = false;
+                break;
+            }
+        }
+
+        if (is_header) {
+            current_cols.clear();
+            for (const auto& t : tokens) current_cols.push_back(std::stoi(t));
+        } else {
+            // Data Line: Row AtomIdx Sym Orb Val1 Val2 ...
+            // e.g. "1 1 Cd 2s -0.367055 -0.261982 ..."
+            if (tokens.size() < 4 + current_cols.size()) continue; // Safety check
+            
+            int row = std::stoi(tokens[0]) - 1; // 1-based to 0-based indexing
+            for (size_t i = 0; i < current_cols.size(); ++i) {
+                int col = current_cols[i] - 1;
+                double val = std::stod(tokens[i + 4]); // Values start at token index 4
+                ptr[(size_t)row * n_ao + col] = val;
+            }
+        }
+    }
+    return result_np;
+}
+
+// 2. Ultra-Fast Raw Binary Loader
+py::array_t<double> load_raw_binary_matrix_cpp(const std::string& bin_path, int n_ao) {
+    size_t expected_size = (size_t)n_ao * n_ao * sizeof(double);
+    int fd = open(bin_path.c_str(), O_RDONLY);
+    if (fd == -1) throw std::runtime_error("C++ Error: Could not open binary file.");
+
+    auto result_np = py::array_t<double>({n_ao, n_ao});
+    double* ptr = result_np.mutable_data();
+
+    // Direct system read into pre-allocated NumPy buffer
+    if (read(fd, ptr, expected_size) != (ssize_t)expected_size) {
+        close(fd);
+        throw std::runtime_error("C++ Error: Binary file size mismatch. Try deleting the .raw.bin file.");
+    }
+    close(fd);
+    return result_np;
+}
+
+
 
 
 
@@ -6236,6 +6463,15 @@ PYBIND11_MODULE(libint_cpp, m)
     m.def("parse_cp2k_mos", &parse_cp2k_mos_cpp, 
           "Ultra-fast C++ parser for CP2K MO text files",
           py::arg("filename"), py::arg("n_ao_total"));
+
+    m.def("parse_cp2k_block_matrix", &parse_cp2k_block_matrix_cpp, 
+          "Fast C++ parser for CP2K Block-Dense matrices",
+          py::arg("filename"), py::arg("n_ao"));
+          
+    m.def("load_raw_binary", &load_raw_binary_matrix_cpp, 
+          "Instant raw binary loader",
+          py::arg("filename"), py::arg("n_ao"));
+
 }
 
 

@@ -1,11 +1,13 @@
 import numpy as np
 import time
 import sys
+from miniBSE.io_utils import get_vxc_ao_matrix
 
 class ExcitonHamiltonian:
     def __init__(self, C, eps, overlap, atom_ao_ranges, homo_index, n_occ, n_virt, scissor_ev, gamma_qp, gamma_bse, material=None, 
                  gamma_bare=None, gamma_penalty=None, alpha=1.0, include_exchange=False, estimate_qp=False, e_thresh=None, f_thresh=0.0, mu_ia_x=None, mu_ia_y=None, mu_ia_z=None, 
-                 charge_type='mulliken', soc_U=None, soc_E=None, device="numpy", precomputed_sigma=None):
+                 charge_type='mulliken', soc_U=None, soc_E=None, device="numpy", precomputed_sigma=None,
+                 vxc_ao_path=None, nthreads=1):
         
         self.include_exchange = include_exchange
         self.estimate_qp = estimate_qp
@@ -128,7 +130,7 @@ class ExcitonHamiltonian:
                     sex = 0.0
                     for j in range(n_valence_occ):
                         q_ij = q_act_occ_val[i, j, :]
-                        sex -= np.dot(q_ij, self.gamma_bare @ q_ij)
+                        sex -= np.dot(q_ij, W @ q_ij)
                     
                     # Apply the isolated Hubbard penalty (Push occupied DOWN)
                     sic = np.dot(q_ii, self.gamma_penalty @ q_ii) if self.gamma_penalty is not None else 0.0
@@ -174,13 +176,55 @@ class ExcitonHamiltonian:
                 print(f"       HOMO Top 5 Atom Charges (q): {q_homo[top_homo_atoms]}")
                 print(f"       LUMO Top 5 Atom Charges (q): {q_lumo[top_lumo_atoms]}")
                 # -----------------------------------
-    
-                # 3. Vxc Cancellation (HOMO Referencing)
-                homo_raw_shift = sigma_occ_raw[-1]
-                self.sigma_occ = sigma_occ_raw - homo_raw_shift
-                self.sigma_virt = sigma_virt_raw - homo_raw_shift 
-                
-                print(f"       Calculated Gap Correction: {(self.sigma_virt[0] - self.sigma_occ[-1]):+8.4f} eV")
+                # 3. Exact Vxc Correction from AO Matrix OR HOMO Referencing
+                import os
+                if vxc_ao_path is not None and os.path.exists(vxc_ao_path):
+                    print("\n  [Vxc] Applying Exact State-Dependent Vxc Integrals...")
+                    V_ao = get_vxc_ao_matrix(vxc_ao_path, self.overlap.shape[0])
+                    
+                    vxc_occ = np.zeros(self.n_occ_act)
+                    for i in range(self.n_occ_act):
+                        c_i = self.C_orig_occ[:, i]
+                        vxc_occ[i] = c_i.T @ V_ao @ c_i
+                    
+                    vxc_virt = np.zeros(self.n_virt_act)
+                    for a in range(self.n_virt_act):
+                        c_a = self.C_orig_virt[:, a]
+                        vxc_virt[a] = c_a.T @ V_ao @ c_a
+
+                    HA_TO_EV = 27.211386
+                    vxc_occ_ev = vxc_occ * HA_TO_EV
+                    vxc_virt_ev = vxc_virt * HA_TO_EV
+
+                    print(f"       HOMO Exact Vxc: {vxc_occ_ev[-1]:8.4f} eV")
+                    print(f"       LUMO Exact Vxc: {vxc_virt_ev[0]:8.4f} eV")
+                    
+                    # Apply Exact State-Dependent G0W0 Equation
+                    self.sigma_occ = sigma_occ_raw - vxc_occ_ev
+                    self.sigma_virt = sigma_virt_raw - vxc_virt_ev
+                    
+                    cohsex_gap_corr = self.sigma_virt[0] - self.sigma_occ[-1]
+                    print(f"       Exact Vxc Gap Correction: {cohsex_gap_corr:+8.4f} eV")
+
+                else:
+                    # Fallback to standard HOMO-referencing
+                    if vxc_ao_path is not None:
+                        print(f"\n  [Vxc] WARNING: '{vxc_ao_path}' not found! Falling back to HOMO-referencing.")
+                        
+                    homo_raw_shift = sigma_occ_raw[-1]
+                    self.sigma_occ = sigma_occ_raw - homo_raw_shift
+                    self.sigma_virt = sigma_virt_raw - homo_raw_shift 
+                    
+                    cohsex_gap_corr = self.sigma_virt[0] - self.sigma_occ[-1]
+                    print(f"       Pure COHSEX Gap Correction: {cohsex_gap_corr:+8.4f} eV")
+ 
+                # 4. HYBRID GW APPROACH: Anchor to Tabulated GW Scissor
+                if scissor_ev != 0.0:
+                    print(f"       Tabulated GW Target Shift : {scissor_ev:+8.4f} eV")
+                    residual_shift = scissor_ev - cohsex_gap_corr
+                    self.sigma_virt += residual_shift
+                    print(f"       -> Applied residual shift of {residual_shift:+8.4f} eV to virtuals to match Tabulated GW Gap.")
+                    
                 print(f"    Completed in {time.time() - t_qp:2.4f} s")
         else:
             # --- MANUAL SCISSOR MODE ---

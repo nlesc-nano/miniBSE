@@ -14,6 +14,7 @@ __pycache__/
 *.dylib
 *.dll
 *.o
+bundle.txt
 
 # CMake/Make artifacts (in case you build locally outside a dedicated folder)
 CMakeCache.txt

@@ -214,5 +214,14 @@ PYBIND11_MODULE(libint_cpp, m)
     m.def("parse_cp2k_mos", &parse_cp2k_mos_cpp, 
           "Ultra-fast C++ parser for CP2K MO text files",
           py::arg("filename"), py::arg("n_ao_total"));
+
+    m.def("parse_cp2k_block_matrix", &parse_cp2k_block_matrix_cpp, 
+          "Fast C++ parser for CP2K Block-Dense matrices",
+          py::arg("filename"), py::arg("n_ao"));
+          
+    m.def("load_raw_binary", &load_raw_binary_matrix_cpp, 
+          "Instant raw binary loader",
+          py::arg("filename"), py::arg("n_ao"));
+
 }
 

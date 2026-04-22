@@ -11,7 +11,8 @@ class ExcitonSolver:
                  homo_index, n_occ, n_virt, scissor_ev, kernel, alpha, beta=0.0, material=None, 
                  include_exchange=False, estimate_qp=False, e_thresh=None, f_thresh=0.0, 
                  mu_ia_x=None, mu_ia_y=None, mu_ia_z=None, eps_out=2.0, 
-                 soc_U=None, soc_E=None, device="numpy", precomputed_sigma=None): 
+                 soc_U=None, soc_E=None, device="numpy", precomputed_sigma=None, 
+                 vxc_ao_path=None, nthreads=1):
 
         self.C = C
         self.overlap = overlap
@@ -46,15 +47,16 @@ class ExcitonSolver:
         self.ham = ExcitonHamiltonian(
             C=C, eps=eps, overlap=overlap, atom_ao_ranges=atom_ao_ranges,
             homo_index=homo_index, n_occ=n_occ, n_virt=n_virt, scissor_ev=scissor_ev,
-            gamma_qp=gamma_qp,        # NEW
-            gamma_bse=gamma_bse,      # NEW
+            gamma_qp=gamma_qp,        
+            gamma_bse=gamma_bse,      
             material=material,
             gamma_bare=gamma_bare,
             gamma_penalty=gamma_penalty,
             alpha=alpha,            
             include_exchange=include_exchange, estimate_qp=estimate_qp, e_thresh=e_thresh, 
             f_thresh=f_thresh, mu_ia_x=mu_ia_x, mu_ia_y=mu_ia_y, mu_ia_z=mu_ia_z, 
-            soc_U=soc_U, soc_E=soc_E, device=device, precomputed_sigma=precomputed_sigma # <--- ADDED
+            soc_U=soc_U, soc_E=soc_E, device=device, precomputed_sigma=precomputed_sigma,
+            vxc_ao_path=vxc_ao_path, nthreads=nthreads
         )
 
     def solve(self, nroots=10, full_diag=False, tol=1e-5):
