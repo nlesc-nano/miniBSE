@@ -1,4 +1,6 @@
 import argparse
+import atexit
+import json
 import numpy as np
 import sys
 import os
@@ -20,7 +22,86 @@ from miniBSE.integrals import compute_dipole_ao
 from miniBSE.oscillator import compute_oscillator_strengths
 from miniBSE.hardness import MATERIAL_DB, estimate_brus_qp_gap, estimate_gw_qp_gap
 from miniBSE.orbital_analysis import compute_spin_character, print_orbital_summary
-from miniBSE.fuzzy_bands import run_fuzzy_bands_and_pdos
+from miniBSE.fuzzy_bands import run_fuzzy_bands_and_pdos, build_qp_energies
+
+
+class TeeStream:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+
+def setup_run_logging(log_file):
+    if log_file in (None, "", "none", "None", False):
+        return None
+
+    log_handle = open(log_file, "w", encoding="utf-8")
+    sys.stdout = TeeStream(sys.__stdout__, log_handle)
+    sys.stderr = TeeStream(sys.__stderr__, log_handle)
+
+    def close_log():
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
+        log_handle.close()
+
+    atexit.register(close_log)
+    print(f"  [Log] Writing full run log to {log_file}")
+    return log_handle
+
+
+def print_qp_provenance(details, dft_gap=None, target_qp_gap=None, output_file=None):
+    if not details:
+        return
+
+    print("\n  [QP Provenance] Scaled-GW hardness dictionary model")
+    print(f"    Material                 : {details['material']}")
+    print(f"    Cluster radius           : {details['cluster_radius_ang']:.3f} Å")
+    print(f"    Bulk PBE -> GW gap       : {details['bulk_pbe_gap_ev']:.3f} -> {details['bulk_gw_gap_ev']:.3f} eV")
+    print(f"    Bulk GW shift            : {details['bulk_gw_shift_ev']:+.3f} eV")
+    if details.get("has_monomer_anchor"):
+        print(f"    Monomer anchor radius    : {details['monomer_radius_ang']:.3f} Å")
+        print(f"    Monomer PBE -> GW gap    : {details['monomer_pbe_gap_ev']:.3f} -> {details['monomer_gw_gap_ev']:.3f} eV")
+        print(f"    Geometric damping gamma  : {details['geometric_damping_gamma_ang']:.3f} Å")
+    print(f"    Vacuum finite-size shift : {details['finite_size_shift_vacuum_ev']:+.3f} eV")
+    print(f"    Solvent finite-size shift: {details['finite_size_shift_solvent_ev']:+.3f} eV")
+    print(f"    Vacuum scissor           : {details['total_scissor_vacuum_ev']:+.3f} eV")
+    print(f"    Solvent scissor used     : {details['total_scissor_solvent_ev']:+.3f} eV")
+    if dft_gap is not None and target_qp_gap is not None:
+        print(f"    Final gap                : {dft_gap:.3f} -> {target_qp_gap:.3f} eV")
+    if output_file:
+        print(f"    JSON                     : {output_file}")
+
+
+def write_qp_provenance(details, dft_gap, target_qp_gap, scissor, args, filename="qp_provenance.json"):
+    if not details:
+        return None
+
+    payload = dict(details)
+    payload.update({
+        "dft_gap_ev": float(dft_gap),
+        "target_qp_gap_ev": float(target_qp_gap),
+        "scissor_used_ev": float(scissor),
+        "estimate_qp": bool(getattr(args, "estimate_qp", False)),
+        "experimental_cohsex_tb_enabled": bool(getattr(args, "estimate_qp", False)),
+        "use_cohsex_gap": bool(getattr(args, "use_cohsex_gap", False)),
+        "notes": [
+            "The scaled-GW hardness dictionary model is the recommended QP correction path.",
+            "The COHSEX/TB Mulliken correction is experimental and not recommended for production QP provenance.",
+        ],
+    })
+
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.write("\n")
+    return filename
 
 def run_solver_and_analysis(solver, coords_ang, syms, shells, mu_ia_x, mu_ia_y, mu_ia_z, dft_gap, scissor, confinement_energy, args, suffix="", soc_gap=None, soc_U=None, soc_E=None):
     """Encapsulates the solving, printing, analysis, and exporting."""
@@ -289,6 +370,7 @@ def main():
     parser.add_argument("--csv-roots", type=int, default=10)
     parser.add_argument("--time", type=float, default=0.0)
     parser.add_argument("--save-xia", action="store_true")
+    parser.add_argument("--log_file", type=str, default="minibse.log", help="Write terminal output to this log file as well as stdout; use 'none' to disable.")
  
     parser.add_argument("--nroots", type=int, default=10)
     parser.add_argument("--full-diag", action="store_true")
@@ -305,11 +387,14 @@ def main():
     parser.add_argument("--fuzzy_sigma", type=float, default=0.03)
     parser.add_argument("--pdos_sigma", type=float, default=0.10)
     parser.add_argument("--ewin", type=float, nargs=2, default=[-5.0, 5.0])
+    parser.add_argument("--fold_to_bz", action="store_true", help="Fold fuzzy-band weights into the first Brillouin zone by summing reciprocal replicas.")
+    parser.add_argument("--g_shell", type=int, default=0, help="Reciprocal-vector shell for folded fuzzy-band weights; 0, 1, and 2 use 1, 27, and 125 replicas.")
+    parser.add_argument("--dashboard_energy_mode", choices=["dft", "qp", "both"], default="dft", help="Generate fuzzy dashboards on DFT, QP-corrected, or both energy axes.")
 
     args = parser.parse_args()
 
+    config_path = args.config
     if args.config:
-        print(f"Loading configuration from {args.config}...")
         with open(args.config, 'r') as f:
             config_data = yaml.safe_load(f)
             
@@ -318,6 +403,10 @@ def main():
                 for key, value in parameters.items(): setattr(args, key, value)
             else:
                 setattr(args, section, parameters)
+
+    setup_run_logging(getattr(args, "log_file", "minibse.log"))
+    if config_path:
+        print(f"Loading configuration from {config_path}...")
 
     required_args = ['mo_file', 'xyz', 'basis_txt', 'basis_name', 'qp_gap']
     missing = [arg for arg in required_args if getattr(args, arg) is None]
@@ -361,6 +450,7 @@ def main():
     dft_gap = eps[homo_index + 1] - eps[homo_index]
     target_qp_gap = dft_gap
     confinement_energy = 0.0
+    qp_provenance = None
     
     if isinstance(args.qp_gap, str):
         if args.qp_gap.lower() == "brus":
@@ -375,7 +465,9 @@ def main():
                 
         elif args.qp_gap.lower() == "gw":
             # Compute the Scaled GW Scissor directly
-            gw_scissor = estimate_gw_qp_gap(np.array(coords_ang), syms, args.material, args.eps_out)
+            gw_scissor, qp_provenance = estimate_gw_qp_gap(
+                np.array(coords_ang), syms, args.material, args.eps_out, return_details=True
+            )
             
             if gw_scissor is not None:
                 scissor = gw_scissor
@@ -386,8 +478,9 @@ def main():
                 target_qp_gap = dft_gap
                 
             if args.estimate_qp:
-                print("  [Note] qp_gap is set to 'gw'. This provides the full Many-Body/Polarization shift.")
-                print("  [Note] You should set 'estimate_qp: false' in config.yaml to avoid double-counting COHSEX!")
+                print("  [QP Warning] qp_gap is set to 'gw', which already uses the recommended scaled-GW hardness model.")
+                print("  [QP Warning] estimate_qp enables the experimental COHSEX/TB Mulliken correction and can double-count QP shifts.")
+                print("  [QP Warning] Production runs should use estimate_qp: false unless you explicitly want this experimental path.")
     else:
         # Numeric explicit gap provided
         target_qp_gap = float(args.qp_gap)
@@ -396,6 +489,8 @@ def main():
     print(f"\n  [DFT] Initial Gap  : {dft_gap:.4f} eV")
     print(f"  [QP]  Target Gap   : {target_qp_gap:.4f} eV")
     print(f"  [QP]  Scissor Shift: {scissor:.4f} eV")
+    qp_provenance_file = write_qp_provenance(qp_provenance, dft_gap, target_qp_gap, scissor, args)
+    print_qp_provenance(qp_provenance, dft_gap=dft_gap, target_qp_gap=target_qp_gap, output_file=qp_provenance_file)
    
     # =========================================================================
     # DYNAMIC IP & EA PREDICTION (Vacuum-Anchored Projection Method)
@@ -618,7 +713,8 @@ def main():
         run_fuzzy_bands_and_pdos(
             args, C_dense, S, eps_shifted, occ, homo_index, e_homo, e_lumo, e_fermi_raw, 
             syms, coords_ang, shells, pops_sf, 
-            soc_active_indices=fuzzy_active_indices, soc_E_act=fuzzy_soc_E, soc_U_act=fuzzy_soc_U, spinor_homo_idx=fuzzy_spinor_homo_idx
+            soc_active_indices=fuzzy_active_indices, soc_E_act=fuzzy_soc_E, soc_U_act=fuzzy_soc_U, spinor_homo_idx=fuzzy_spinor_homo_idx,
+            qp_energies=build_qp_energies(eps_shifted, homo_index, scissor_ev=scissor)
         )
 
 
@@ -720,4 +816,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

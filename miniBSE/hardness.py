@@ -70,7 +70,7 @@ MATERIAL_DB = {
 
     # IV–VI Semiconductors
     "PBS": (17.2, 200.0, 5.94, 0.41, 23.0, 0.09, 0.027, 0.15, 0.65, 7.2378, -6.638, -4.3253, -8.128, -2.3724),
-    "PBSE": (22.9, 460.0, 6.12, 0.27, 30.0, 0.07, 0.017, 0.05, 0.55, 7.3935, -6.5104, -4.2415, -7.8234, -2.3177)
+    "PBSE": (22.9, 460.0, 6.12, 0.27, 30.0, 0.07, 0.017, 0.05, 0.55, 7.3935, -6.5104, -4.2415, -7.8234, -2.3177),
 
     "DEFAULT": (1.0, 1.0, 5.0, 0.0, 1.0, 1.0, 0.02, 0.00, 0.00)
 
@@ -89,7 +89,7 @@ MATERIAL_ELEMENTS = {
     "PBS":     ["Pb", "S"], "PBSE":    ["Pb", "Se"]
 }
 
-def estimate_gw_qp_gap(coords, atom_symbols, material_name, eps_out):
+def estimate_gw_qp_gap(coords, atom_symbols, material_name, eps_out, return_details=False):
     """
     Computes the parameter-free Quasiparticle Scissor using tabulated bulk GW data.
     Uses an exact monomer GW limit (vacuum) to prevent 1/R divergence at ultrasmall sizes,
@@ -97,17 +97,17 @@ def estimate_gw_qp_gap(coords, atom_symbols, material_name, eps_out):
     """
     if material_name is None:
         print("  [Warning] Material not specified. Cannot compute GW scaling.")
-        return None
+        return (None, None) if return_details else None
         
     m_name = material_name.upper()
     if m_name not in MATERIAL_DB:
         print(f"  [Warning] Material {m_name} not found in MATERIAL_DB. GW estimation failed.")
-        return None
+        return (None, None) if return_details else None
         
     entry = MATERIAL_DB[m_name]
     if len(entry) < 9:
         print(f"  [Warning] MATERIAL_DB entry for {m_name} is outdated. GW estimation failed.")
-        return None
+        return (None, None) if return_details else None
         
     # Extract Bulk Data
     eps_inf = entry[0]
@@ -116,7 +116,7 @@ def estimate_gw_qp_gap(coords, atom_symbols, material_name, eps_out):
     
     if gap_gw_bulk == 0.0:
         print(f"  [Warning] Missing GW bulk gap for {m_name}. GW estimation failed.")
-        return None
+        return (None, None) if return_details else None
         
     # Extract Monomer Data (if available in the tuple)
     has_monomer_data = len(entry) >= 14
@@ -165,6 +165,13 @@ def estimate_gw_qp_gap(coords, atom_symbols, material_name, eps_out):
     else:
         print("    -> Geometric Damping  : γ = 0.000 Å (Using standard 1/R without monomer data)")
 
+    def damped_surface_shift(kappa):
+        if has_monomer_data and gap_gw_mono > 0 and R_QD_ang <= (R_mono + 0.01):
+            return sigma_max_vac * (kappa / kappa_vac) if kappa_vac != 0.0 else 0.0
+        if gamma > 0.0:
+            return kappa / (R_QD_ang + gamma)
+        return kappa / R_QD_ang
+
     # --- 3. Solvent-Screened Surface Polarization ---
     # Now use the user's actual solvent (eps_out)
     kappa_solvent = 11.52 * ((1.0 / eps_out) - (1.0 / eps_inf))
@@ -172,13 +179,8 @@ def estimate_gw_qp_gap(coords, atom_symbols, material_name, eps_out):
     # NEW: HARD CLAMP AT THE MONOMER LIMIT
     if has_monomer_data and gap_gw_mono > 0 and R_QD_ang <= (R_mono + 0.01): 
         print(f"    -> Monomer Limit Reached: Clamping to exact CP2K monomer shift.")
-        # Bypass gamma entirely. Use explicit shift scaled by solvent ratio.
-        sigma_pol = sigma_max_vac * (kappa_solvent / kappa_vac)
-    elif gamma > 0.0:
-        sigma_pol = kappa_solvent / (R_QD_ang + gamma)
-    else:
-        # If gamma is 0 (classical limit), just use the Brus formula
-        sigma_pol = kappa_solvent / R_QD_ang
+    sigma_pol = damped_surface_shift(kappa_solvent)
+    sigma_pol_vac = damped_surface_shift(kappa_vac)
 
     print(f"    Solvent Dielectric    : eps_out = {eps_out:.2f}, eps_inf = {eps_inf:.2f}")
     print(f"    -> Polarization Shift : {sigma_pol:+.3f} eV")
@@ -186,7 +188,32 @@ def estimate_gw_qp_gap(coords, atom_symbols, material_name, eps_out):
     # --- 4. Total Quasiparticle Scissor ---
     total_scissor = delta_bulk_qp + sigma_pol
     print(f"    ==> Total GW Scissor  : {total_scissor:+.3f} eV\n")
-    
+
+    details = {
+        "qp_model": "scaled_gw_hardness_dictionary",
+        "material": m_name,
+        "cluster_radius_ang": float(R_QD_ang),
+        "eps_out": float(eps_out),
+        "eps_inf": float(eps_inf),
+        "bulk_pbe_gap_ev": float(gap_pbe_bulk),
+        "bulk_gw_gap_ev": float(gap_gw_bulk),
+        "bulk_gw_shift_ev": float(delta_bulk_qp),
+        "has_monomer_anchor": bool(has_monomer_data and gap_gw_mono > 0),
+        "monomer_radius_ang": float(R_mono) if has_monomer_data else None,
+        "monomer_pbe_gap_ev": float(gap_pbe_mono) if has_monomer_data else None,
+        "monomer_gw_gap_ev": float(gap_gw_mono) if has_monomer_data else None,
+        "monomer_extra_vacuum_shift_ev": float(sigma_max_vac) if has_monomer_data else None,
+        "geometric_damping_gamma_ang": float(gamma),
+        "kappa_vacuum_ev_ang": float(kappa_vac),
+        "kappa_solvent_ev_ang": float(kappa_solvent),
+        "finite_size_shift_vacuum_ev": float(sigma_pol_vac),
+        "finite_size_shift_solvent_ev": float(sigma_pol),
+        "total_scissor_vacuum_ev": float(delta_bulk_qp + sigma_pol_vac),
+        "total_scissor_solvent_ev": float(total_scissor),
+    }
+
+    if return_details:
+        return total_scissor, details
     return total_scissor
 
 def compute_delta_xc(material):
@@ -415,4 +442,3 @@ def estimate_brus_qp_gap(material_name, coords, atom_symbols):
     print(f"    Predicted QP Gap : {predicted_gap:.3f} eV")
     
     return predicted_gap
-

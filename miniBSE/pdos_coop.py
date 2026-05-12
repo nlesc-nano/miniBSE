@@ -3,29 +3,10 @@ import csv
 import time
 from miniBSE.io_utils import count_ao_from_shells
 
-def compute_pdos_and_coop(C, S, eps_eV, shells, pdos_atoms, coop_pairs, ewin, sigma=0.03, is_soc=False, prefix="sf", pops=None):
-    t0 = time.time()
-    print(f"  [PDOS/COOP] Analyzing {len(pdos_atoms)} elements, {len(coop_pairs)} bonds, IPR, and Surface/Core...")
-    
-    C_dense = C.toarray() if hasattr(C, 'toarray') else C
-    S_dense = S.toarray() if hasattr(S, 'toarray') else S
-    
-    if pops is not None:
-        P_weights = pops
-    else:
-        if is_soc:
-            n_ao = S_dense.shape[0]
-            C_a, C_b = C_dense[:n_ao, :], C_dense[n_ao:, :]
-            SC_a, SC_b = S_dense @ C_a, S_dense @ C_b
-            P_weights = np.real(C_a.conj() * SC_a) + np.real(C_b.conj() * SC_b)
-        else:
-            SC = S_dense @ C_dense
-            P_weights = np.real(C_dense.conj() * SC)
-            
-    # --- 0. Fix AO Mapping & Identify Surface AOs ---
+def _ao_metadata(shells):
     ao_to_sym = []
     ao_to_coord = []
-    
+
     # Use the robust internal counter so we never misalign AOs
     for sh in shells:
         n_funcs = count_ao_from_shells([sh])
@@ -37,20 +18,29 @@ def compute_pdos_and_coop(C, S, eps_eV, shells, pdos_atoms, coop_pairs, ewin, si
             
     ao_to_sym = np.array(ao_to_sym)
     ao_to_coord = np.array(ao_to_coord)
-    
+
     # Surface vs Core Logic (Outer 25% of the radius is considered Surface)
     unique_coords = np.unique(ao_to_coord, axis=0)
     COM = np.mean(unique_coords, axis=0)
     ao_dists = np.linalg.norm(ao_to_coord - COM, axis=1)
     R_max = np.max(ao_dists)
-    
     surface_ao_mask = np.ones(len(ao_dists), dtype=bool) if R_max < 1e-3 else (ao_dists >= 0.75 * R_max)
-    
+
+    return ao_to_sym, surface_ao_mask
+
+
+def export_pdos_coop_data(analysis, eps_eV, pdos_atoms, coop_pairs, ewin, sigma=0.03, is_soc=False, prefix="sf"):
+    """Export PDOS/COOP/IPR using precomputed weights and a supplied energy axis."""
+    P_weights = analysis["P_weights"]
+    ao_to_sym = analysis["ao_to_sym"]
+    surface_ao_mask = analysis["surface_ao_mask"]
+    coop_results = analysis["coop_results"]
+
     mask = (eps_eV >= ewin[0]) & (eps_eV <= ewin[1])
     E_sticks = eps_eV[mask]
 
     # --- 1. Compute Inverse Participation Ratio (IPR) ---
-    IPR = np.sum(P_weights**2, axis=0)
+    IPR = analysis["IPR"]
     
     with open(f"ipr_data_{prefix}.csv", "w", newline="") as f:
         w = csv.writer(f)
@@ -96,28 +86,6 @@ def compute_pdos_and_coop(C, S, eps_eV, shells, pdos_atoms, coop_pairs, ewin, si
             for iE, E in enumerate(energy_grid):
                 w.writerow([E] + list(Ycum[iE, :]))
                 
-    # --- 4. Compute COOP ---
-    coop_results = {}
-    if is_soc: C_a, C_b = C_dense[:S_dense.shape[0], :], C_dense[S_dense.shape[0]:, :]
-        
-    for pair in coop_pairs:
-        a_sym, b_sym = pair.split("-")
-        idx_A = np.where(ao_to_sym == a_sym)[0]
-        idx_B = np.where(ao_to_sym == b_sym)[0]
-        if len(idx_A) == 0 or len(idx_B) == 0: continue
-        
-        S_AB = S_dense[np.ix_(idx_A, idx_B)]
-        
-        if is_soc:
-            XB_a, XB_b = S_AB @ C_a[idx_B, :], S_AB @ C_b[idx_B, :]
-            coop_n = 2.0 * (np.sum(C_a[idx_A, :].conj() * XB_a, axis=0).real + 
-                            np.sum(C_b[idx_A, :].conj() * XB_b, axis=0).real)
-        else:
-            XB = S_AB @ C_dense[idx_B, :]
-            coop_n = 2.0 * np.sum(C_dense[idx_A, :].conj() * XB, axis=0).real
-            
-        coop_results[pair] = coop_n
-
     if coop_results:
         with open(f"coop_data_{prefix}.csv", "w", newline="") as f:
             w = csv.writer(f)
@@ -125,6 +93,63 @@ def compute_pdos_and_coop(C, S, eps_eV, shells, pdos_atoms, coop_pairs, ewin, si
             for i, en in enumerate(E_sticks):
                 idx = np.where(mask)[0][i]
                 w.writerow([en] + [coop_results[p][idx] for p in coop_results.keys()])
+
+
+def compute_pdos_and_coop(C, S, eps_eV, shells, pdos_atoms, coop_pairs, ewin, sigma=0.03, is_soc=False, prefix="sf", pops=None):
+    t0 = time.time()
+    print(f"  [PDOS/COOP] Analyzing {len(pdos_atoms)} elements, {len(coop_pairs)} bonds, IPR, and Surface/Core...")
+    
+    C_dense = C.toarray() if hasattr(C, 'toarray') else C
+    S_dense = S.toarray() if hasattr(S, 'toarray') else S
+    
+    if pops is not None:
+        P_weights = pops
+    else:
+        if is_soc:
+            n_ao = S_dense.shape[0]
+            C_a, C_b = C_dense[:n_ao, :], C_dense[n_ao:, :]
+            SC_a, SC_b = S_dense @ C_a, S_dense @ C_b
+            P_weights = np.real(C_a.conj() * SC_a) + np.real(C_b.conj() * SC_b)
+        else:
+            SC = S_dense @ C_dense
+            P_weights = np.real(C_dense.conj() * SC)
+            
+    # --- 0. Fix AO Mapping & Identify Surface AOs ---
+    ao_to_sym, surface_ao_mask = _ao_metadata(shells)
+
+    # --- 4. Compute COOP weights once. QP dashboards reuse these unchanged. ---
+    coop_results = {}
+    if is_soc:
+        C_a, C_b = C_dense[:S_dense.shape[0], :], C_dense[S_dense.shape[0]:, :]
+
+    for pair in coop_pairs:
+        a_sym, b_sym = pair.split("-")
+        idx_A = np.where(ao_to_sym == a_sym)[0]
+        idx_B = np.where(ao_to_sym == b_sym)[0]
+        if len(idx_A) == 0 or len(idx_B) == 0:
+            continue
+
+        S_AB = S_dense[np.ix_(idx_A, idx_B)]
+
+        if is_soc:
+            XB_a, XB_b = S_AB @ C_a[idx_B, :], S_AB @ C_b[idx_B, :]
+            coop_n = 2.0 * (np.sum(C_a[idx_A, :].conj() * XB_a, axis=0).real +
+                            np.sum(C_b[idx_A, :].conj() * XB_b, axis=0).real)
+        else:
+            XB = S_AB @ C_dense[idx_B, :]
+            coop_n = 2.0 * np.sum(C_dense[idx_A, :].conj() * XB, axis=0).real
+
+        coop_results[pair] = coop_n
+
+    analysis = {
+        "P_weights": P_weights,
+        "ao_to_sym": ao_to_sym,
+        "surface_ao_mask": surface_ao_mask,
+        "IPR": np.sum(P_weights**2, axis=0),
+        "coop_results": coop_results,
+    }
+
+    export_pdos_coop_data(analysis, eps_eV, pdos_atoms, coop_pairs, ewin, sigma=sigma, is_soc=is_soc, prefix=prefix)
                 
     print(f"  [PDOS/COOP] Exported {prefix} data in {time.time() - t0:.2f} s")
-
+    return analysis

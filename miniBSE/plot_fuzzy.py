@@ -5,6 +5,7 @@ from plotly.subplots import make_subplots
 import os
 import re
 from scipy.spatial import cKDTree
+from scipy.ndimage import gaussian_filter, median_filter
 
 def load_fuzzy(npz_path):
     d = np.load(npz_path, allow_pickle=True)
@@ -36,6 +37,70 @@ def load_ipr_csv(csv_path):
     if not os.path.exists(csv_path): return np.array([]), np.array([])
     df = pd.read_csv(csv_path)
     return df.iloc[:, 0].to_numpy(dtype=float), df.iloc[:, 1].to_numpy(dtype=float)
+
+def prepare_fuzzy_display(Z, fuzzy_display_mode="raw"):
+    if fuzzy_display_mode == "raw":
+        Zpos = Z[Z > 1e-9]
+        vmax = float(np.percentile(Z, 99.9))
+        vmin_base = float(np.percentile(Zpos, 5)) if Zpos.size else 1e-6
+        Zm = Z.astype(np.float32); Zm[Zm <= 0] = np.nan
+        return np.log10(Zm), float(np.log10(vmin_base)), float(np.log10(vmax)), vmin_base, vmax
+
+    if fuzzy_display_mode == "soft_log":
+        Zplot = Z.astype(float, copy=True)
+        max_z = np.nanmax(Zplot)
+        if not np.isfinite(max_z) or max_z <= 0:
+            return np.full_like(Zplot, np.nan, dtype=float), 0.0, 1.0, 1.0, 10.0
+
+        floor = 1e-4 * max_z
+        Zplot[Zplot < floor] = np.nan
+        Zplot = gaussian_filter(Zplot, sigma=(0.4, 0.0), mode="nearest")
+
+        Zscale = np.nanpercentile(Zplot, 99.8)
+        if not np.isfinite(Zscale) or Zscale <= 0:
+            Zscale = max_z
+
+        Zlog = np.log10(1.0 + 100.0 * Zplot / Zscale)
+        zmin = float(np.nanpercentile(Zlog, 5))
+        zmax = float(np.nanpercentile(Zlog, 99.8))
+        return Zlog, zmin, zmax, floor, Zscale
+
+    if fuzzy_display_mode == "background_subtracted":
+        Zplot = Z.astype(float, copy=True)
+        background = median_filter(Zplot, size=(15, 5))
+        Zplot = Zplot - 0.7 * background
+        Zplot[Zplot < 0] = 0.0
+        Zplot = gaussian_filter(Zplot, sigma=(0.5, 0.1))
+        Zplot[Zplot <= 0] = np.nan
+
+        finite = Zplot[np.isfinite(Zplot) & (Zplot > 0)]
+        if finite.size:
+            zmin = float(np.log10(np.percentile(finite, 10)))
+            zmax = float(np.log10(np.percentile(finite, 99.8)))
+        else:
+            zmin, zmax = -6.0, 0.0
+
+        return np.log10(Zplot), zmin, zmax, 10.0**zmin, 10.0**zmax
+
+    if fuzzy_display_mode != "column_norm":
+        raise ValueError("fuzzy_display_mode must be 'raw', 'column_norm', 'background_subtracted', or 'soft_log'")
+
+    Zplot = Z.astype(np.float32, copy=True)
+    col_ref = np.percentile(Zplot, 99, axis=0)
+    col_ref[col_ref <= 0] = 1.0
+    Zplot /= col_ref[None, :]
+    Zplot[Zplot < 1e-3] = 0.0
+    Zplot = gaussian_filter(Zplot, sigma=(0.7, 0.15), mode="nearest")
+    Zplot[Zplot <= 0] = np.nan
+
+    finite = Zplot[np.isfinite(Zplot) & (Zplot > 0)]
+    if finite.size:
+        zmin = float(np.log10(np.percentile(finite, 20)))
+        zmax = float(np.log10(np.percentile(finite, 99.7)))
+    else:
+        zmin, zmax = -6.0, 0.0
+
+    return np.log10(Zplot), zmin, zmax, 10.0**zmin, 10.0**zmax
 
 def build_wireframe_agnostic(atoms):
     if len(atoms) < 2: return [], [], []
@@ -82,9 +147,9 @@ def parse_cube(filepath):
     atoms_ang = [(z, ax*BOHR_TO_ANG, ay*BOHR_TO_ANG, az*BOHR_TO_ANG) for z, charge, ax, ay, az in atoms]
     return X.flatten(), Y.flatten(), Z.flatten(), V.flatten(), atoms_ang
 
-def generate_interactive_plot(prefix="sf", material="DEFAULT", ef=0.0, e_homo=None, e_lumo=None, normalize_coop=False):
+def generate_interactive_plot(prefix="sf", material="DEFAULT", ef=0.0, e_homo=None, e_lumo=None, normalize_coop=False, energy_label="Energy (eV)", output_html=None, fuzzy_display_mode="raw"):
     lbl = "SOC" if prefix == "soc" else "Spin-Free"
-    print(f"  [Plotter] Generating elegant {lbl} HTML dashboard...")
+    print(f"  [Plotter] Generating elegant {lbl} HTML dashboard ({energy_label})...")
     
     # =========================================================================
     # PART 1: 2D DASHBOARD
@@ -118,16 +183,13 @@ def generate_interactive_plot(prefix="sf", material="DEFAULT", ef=0.0, e_homo=No
 
     Z, ewin = fuzzy["Z"], fuzzy["ewin"]
     kx = np.linspace(fuzzy["extent"][0], fuzzy["extent"][1], Z.shape[1])
-    Zpos = Z[Z > 1e-9]
-    vmax = float(np.percentile(Z, 99.9))
-    vmin_base = float(np.percentile(Zpos, 5)) if Zpos.size else 1e-6
-    Zm = Z.astype(np.float32); Zm[Zm <= 0] = np.nan
+    Z_display, zmin_display, zmax_display, vmin_base, vmax = prepare_fuzzy_display(Z, fuzzy_display_mode=fuzzy_display_mode)
     
     fig.add_shape(type="rect", xref="x", yref="y", x0=kx[0], x1=kx[-1], y0=ewin[0], y1=ewin[1], fillcolor="black", line=dict(width=0), layer="below") 
 
     heat = go.Heatmap(
-        z=np.log10(Zm), x=kx, y=fuzzy["centres"], colorscale="Inferno",
-        zmin=float(np.log10(vmin_base)), zmax=float(np.log10(vmax)), showscale=True,
+        z=Z_display, x=kx, y=fuzzy["centres"], colorscale="Inferno",
+        zmin=zmin_display, zmax=zmax_display, showscale=True,
         zsmooth="best",  # <--- ADD THIS EXACT LINE
         colorbar=dict(title=dict(text="<b>log₁₀(I)</b>", font=dict(size=20)), orientation="h", len=0.30, thickness=20, x=0.17, xanchor="center", y=1.08, yanchor="bottom", tickfont=dict(size=18)),
         hovertemplate="k=%{x:.3f} Å⁻¹<br>E=%{y:.3f} eV<br>log10(I)=%{z:.2f}<extra></extra>"
@@ -200,7 +262,7 @@ def generate_interactive_plot(prefix="sf", material="DEFAULT", ef=0.0, e_homo=No
         fig.update_xaxes(showline=True, linewidth=2, linecolor='black', mirror=True, ticks="outside", gridcolor='rgba(0,0,0,0.1)', zeroline=False, row=1, col=col)
         fig.update_yaxes(showline=True, linewidth=2, linecolor='black', mirror=True, ticks="outside", gridcolor='rgba(0,0,0,0.1)', zeroline=False, row=1, col=col)
         
-    fig.update_yaxes(range=[ewin[0], ewin[1]], title_text="<b>Energy (eV)</b>", title_font=dict(size=28), row=1, col=1)
+    fig.update_yaxes(range=[ewin[0], ewin[1]], title_text=f"<b>{energy_label}</b>", title_font=dict(size=28), row=1, col=1)
     fig.update_xaxes(title_text="<b>k-Path</b>", title_font=dict(size=28), tickangle=0, row=1, col=1)
     fig.update_xaxes(title_text="<b>DOS</b>", title_font=dict(size=28), row=1, col=2)
     fig.update_xaxes(title_text="<b>IPR</b>", title_font=dict(size=28), tickvals=[0, 0.5, 1.0], row=1, col=3)
@@ -325,7 +387,7 @@ def generate_interactive_plot(prefix="sf", material="DEFAULT", ef=0.0, e_homo=No
     <html>
     <head>
         <meta charset="utf-8">
-        <title>miniBSE {lbl} Electronic Structure Analysis</title>
+        <title>miniBSE {lbl} Electronic Structure Analysis - {energy_label}</title>
         <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
         <style>
             body {{ font-family: 'Helvetica', 'Arial', sans-serif; background-color: #f8f9fa; margin: 0; padding: 20px; color: #333; }}
@@ -417,9 +479,8 @@ def generate_interactive_plot(prefix="sf", material="DEFAULT", ef=0.0, e_homo=No
     </html>
     """
     
-    out_html = f"fuzzy_dashboard_{prefix}.html"
+    out_html = output_html or f"fuzzy_dashboard_{prefix}.html"
     with open(out_html, 'w', encoding='utf-8') as f:
         f.write(html_template)
         
     print(f"  [Plotter] Successfully saved elegant HTML dashboard to {out_html}")
-
