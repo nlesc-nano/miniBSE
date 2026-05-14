@@ -73,6 +73,10 @@ class ExcitonHamiltonian:
 
                 self.q_ov[:, :, A] = 0.5 * (Co.T @ SCv + SCo.T @ Cv)
 
+            if self.include_exchange:
+                qv = self.q_virt.reshape(n_virt_act * n_virt_act, self.n_atoms)
+                self.W_virt = (qv @ self.gamma.T).reshape(n_virt_act, n_virt_act, self.n_atoms)
+
             print(f"    Blocks built in {time.time() - t_den:2.4f} s")
 
         if self.estimate_qp:
@@ -419,6 +423,10 @@ class ExcitonHamiltonian:
                 self.q_hole_spinor[:, :, A] = 0.5 * (Co_a.conj().T @ SCo_a + SCo_a.conj().T @ Co_a + Co_b.conj().T @ SCo_b + SCo_b.conj().T @ Co_b)
                 self.q_elec_spinor[:, :, A] = 0.5 * (Cv_a.conj().T @ SCv_a + SCv_a.conj().T @ Cv_a + Cv_b.conj().T @ SCv_b + SCv_b.conj().T @ Cv_b)
 
+        if self.include_exchange:
+            qe = self.q_elec_spinor.reshape(self.n_virt_spinor * self.n_virt_spinor, self.n_atoms)
+            self.W_elec_spinor = (qe @ self.gamma.T).reshape(self.n_virt_spinor, self.n_virt_spinor, self.n_atoms)
+
         print(f"  -> Density mappings compiled natively in {time.time() - t_sp:.2f}s")
 
         # 3. Spinor Zero-Order Energies
@@ -495,8 +503,7 @@ class ExcitonHamiltonian:
             if self.include_exchange:
                 x_mat = np.zeros((self.n_occ_act, self.n_virt_act))
                 x_mat[self.valid_i, self.valid_a] = x
-                W = np.einsum("AB, abB -> abA", self.gamma, self.q_virt)
-                K = np.einsum("ijA, abA, jb -> ia", self.q_occ, W, x_mat)
+                K = np.einsum("ijA, abA, jb -> ia", self.q_occ, self.W_virt, x_mat, optimize=True)
                 y -= 1.0 * K[self.valid_i, self.valid_a]
                 
             return y
@@ -519,10 +526,8 @@ class ExcitonHamiltonian:
             else:
                 x_mat = x.reshape(self.n_occ_spinor, self.n_virt_spinor)
                 
-            # W[a, b, A] = \sum_B \gamma_{AB} q_elec[a, b, B]
-            W = np.einsum("AB, abB -> abA", self.gamma, self.q_elec_spinor)
             # K[i, a] = \sum_{j,b,A} (q_hole[i, j, A])^* W[a, b, A] x_mat[j, b]
-            K = np.einsum("ijA, abA, jb -> ia", self.q_hole_spinor.conj(), W, x_mat)
+            K = np.einsum("ijA, abA, jb -> ia", self.q_hole_spinor.conj(), self.W_elec_spinor, x_mat, optimize=True)
             
             if hasattr(self, 'valid_spinor_idx'):
                 y -= K.flatten()[self.valid_spinor_idx]
@@ -550,4 +555,3 @@ class ExcitonHamiltonian:
             return mu_sp.flatten()[self.valid_spinor_mask] if hasattr(self, 'valid_spinor_mask') else mu_sp.flatten()
 
         return np.column_stack((map_dipole(mu_ia_x), map_dipole(mu_ia_y), map_dipole(mu_ia_z)))
-

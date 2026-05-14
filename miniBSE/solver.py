@@ -6,6 +6,21 @@ from miniBSE.exciton_hamiltonian import ExcitonHamiltonian
 # --- UPDATED IMPORTS ---
 from miniBSE.hardness import build_gamma, build_resta_mnok
 
+
+def _assemble_truncated_exchange(q_hole, w_elec, vi, va, block_size=64):
+    """Build K[p,q] = sum_A q_hole[i_p,i_q,A]^* W_elec[a_p,a_q,A]."""
+    n_p = len(vi)
+    dtype = np.result_type(q_hole, w_elec)
+    K = np.empty((n_p, n_p), dtype=dtype)
+
+    for p0 in range(0, n_p, block_size):
+        p1 = min(p0 + block_size, n_p)
+        qh = q_hole[vi[p0:p1, None], vi[None, :], :].conj()
+        we = w_elec[va[p0:p1, None], va[None, :], :]
+        K[p0:p1, :] = np.einsum("pqA,pqA->pq", qh, we, optimize=True)
+
+    return K
+
 class ExcitonSolver:
     def __init__(self, C, eps, occ, overlap, atom_symbols, atom_coords, atom_ao_ranges, 
                  homo_index, n_occ, n_virt, scissor_ev, kernel, alpha, beta=0.0, material=None, 
@@ -132,20 +147,13 @@ class ExcitonSolver:
                         v_idx = self.ham.valid_spinor_idx
                         vi_sp = v_idx // n_virt_sp
                         va_sp = v_idx % n_virt_sp
-                        n_p = len(v_idx)
                         
-                        print("    -> Constructing K_truncated natively (Zero-Memory Overhead)...")
+                        print("    -> Constructing K_truncated from cached screened pairs...")
                         t_k = time.time()
-                        
-                        # 1. Slice natively 
-                        q_hole_sub = self.ham.q_hole_spinor.conj()[vi_sp[:, None], vi_sp[None, :], :]
-                        q_elec_sub = self.ham.q_elec_spinor[va_sp[:, None], va_sp[None, :], :]
-                        
-                        # 2. Contract Gamma only for the valid pairs
-                        W_sub = (q_elec_sub.reshape(n_p * n_p, -1) @ self.ham.gamma).reshape(n_p, n_p, -1)
-                        
-                        # 3. Element-wise multiply and sum
-                        K_truncated = np.sum(q_hole_sub * W_sub, axis=-1)
+                        W_elec = self.ham.W_elec_spinor
+                        K_truncated = _assemble_truncated_exchange(
+                            self.ham.q_hole_spinor, W_elec, vi_sp, va_sp
+                        )
                         
                         print(f"    -> K_truncated assembled in {time.time()-t_k:.2f}s")
                         
@@ -155,8 +163,7 @@ class ExcitonSolver:
                         # Fallback
                         print("    -> Contracting W = Gamma @ q_elec_spinor ...")
                         t_w = time.time()
-                        W = np.tensordot(self.ham.gamma, self.ham.q_elec_spinor, axes=([1], [2])) 
-                        W = np.transpose(W, (1, 2, 0))
+                        W = self.ham.W_elec_spinor
                         print(f"    -> W contracted in {time.time()-t_w:.2f}s")
                         
                         print("    -> Contracting K_full in Spinor basis...")
@@ -196,4 +203,3 @@ class ExcitonSolver:
             hole = full_idx // self.ham.n_virt_spinor
             elec = full_idx % self.ham.n_virt_spinor
         return hole, elec, abs(vec[idx])
-

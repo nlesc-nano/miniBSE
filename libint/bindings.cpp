@@ -114,14 +114,17 @@ PYBIND11_MODULE(libint_cpp, m)
           auto v = licpp::dipole(shells, origin, nthreads);
           libint2::finalize();
 
-          const ssize_t nbf = v[0].rows();
+          if (v.size() < 4)
+            throw std::runtime_error("Libint emultipole1 did not return overlap + 3 dipole components");
+
+          const ssize_t nbf = v[1].rows();
           std::vector<ssize_t> shape = {3, nbf, nbf};
           py::array_t<double> out(shape);
           auto buf = out.mutable_unchecked<3>();
           for (int c=0;c<3;++c)
             for (ssize_t i=0;i<nbf;++i)
               for (ssize_t j=0;j<nbf;++j)
-                buf(c,i,j) = v[c](i,j);
+                buf(c,i,j) = v[c+1](i,j);
           return out;
         },
         py::arg("shells"), py::arg("origin"), py::arg("nthreads") = 1);
@@ -224,4 +227,3 @@ PYBIND11_MODULE(libint_cpp, m)
           py::arg("filename"), py::arg("n_ao"));
 
 }
-
