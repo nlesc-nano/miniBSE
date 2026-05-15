@@ -23,6 +23,7 @@ from miniBSE.oscillator import compute_oscillator_strengths
 from miniBSE.hardness import MATERIAL_DB, estimate_brus_qp_gap, estimate_gw_qp_gap
 from miniBSE.orbital_analysis import compute_spin_character, print_orbital_summary
 from miniBSE.fuzzy_bands import run_fuzzy_bands_and_pdos, build_qp_energies
+from miniBSE.nto import run_nto_analysis
 
 
 class TeeStream:
@@ -226,6 +227,20 @@ def run_solver_and_analysis(solver, coords_ang, syms, shells, mu_ia_x, mu_ia_y, 
 
         print(f"{n+1:5d} {res['energy']:8.3f} {res['f_osc']:8.4f} | {res['PR']:5.1f} {res['d_eh']:7.2f} {res['d_CT']:7.2f} {res['sigma_h']:6.1f} {res['sigma_e']:6.1f} | {ex_type:>8}")
 
+    if getattr(args, 'nto', False):
+        run_nto_analysis(
+            solver=solver,
+            vectors=vectors,
+            energies_ev=energies_ev,
+            f_strengths=f_strengths,
+            coords=np.array(coords_ang),
+            symbols=syms,
+            mu_ia=mu_ia,
+            args=args,
+            suffix=suffix,
+            soc_U=soc_U if solver.soc_flag else None,
+        )
+
     # =========================================================================
     # EXCITON CUBE GENERATION (MOs are now generated globally before this)
     # =========================================================================
@@ -371,6 +386,11 @@ def main():
     parser.add_argument("--time", type=float, default=0.0)
     parser.add_argument("--save-xia", action="store_true")
     parser.add_argument("--log_file", type=str, default="minibse.log", help="Write terminal output to this log file as well as stdout; use 'none' to disable.")
+
+    parser.add_argument("--nto", action="store_true", help="Run Natural Transition Orbital analysis after solving excitons.")
+    parser.add_argument("--nto-states", type=int, nargs='+', help="Specific exciton states for NTO analysis, 1-indexed.")
+    parser.add_argument("--nto-top", type=int, default=3, help="Number of dominant NTO pairs to print per state.")
+    parser.add_argument("--nto-csv", action="store_true", help="Write detailed NTO descriptors to nto_results*.csv.")
  
     parser.add_argument("--nroots", type=int, default=10)
     parser.add_argument("--full-diag", action="store_true")

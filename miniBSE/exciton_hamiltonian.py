@@ -50,7 +50,7 @@ class ExcitonHamiltonian:
         eps_virt_qp = eps[virt_idx].copy()
         
         # --- MOVE DENSITY BUILDER UP FOR QP CORRECTIONS ---
-        if self.include_exchange or (self.estimate_qp and precomputed_sigma is None):
+        if self.include_exchange or self.soc_flag or (self.estimate_qp and precomputed_sigma is None):
             print(f"\n  Building hole/electron/transition density blocks for Active Space...")
             t_den = time.time()
             self.q_occ = np.zeros((n_occ_act, n_occ_act, self.n_atoms))
@@ -378,56 +378,29 @@ class ExcitonHamiltonian:
         U_occ_b = U_mo[k : k + self.n_occ_act, 0 : self.n_occ_spinor]
         U_virt_b = U_mo[k + self.n_occ_act : 2*k, self.n_occ_spinor : 2*k]
 
-        print("  -> Constructing Spinor AOs natively for fast integrals...")
+        print("  -> Rotating spatial charge tensors into the spinor basis...")
         t_sp = time.time()
-        
-        # Convert spatial MOs to Spinor MOs natively
-        C_o = self.C_orig_occ
-        C_v = self.C_orig_virt
-        
-        C_sp_occ_a = C_o @ U_occ_a
-        C_sp_occ_b = C_o @ U_occ_b
-        C_sp_virt_a = C_v @ U_virt_a
-        C_sp_virt_b = C_v @ U_virt_b
-        
-        overlap_dense = self.overlap.toarray() if hasattr(self.overlap, 'toarray') else self.overlap
-        SC_sp_occ_a = overlap_dense @ C_sp_occ_a
-        SC_sp_occ_b = overlap_dense @ C_sp_occ_b
-        SC_sp_virt_a = overlap_dense @ C_sp_virt_a
-        SC_sp_virt_b = overlap_dense @ C_sp_virt_b
-        
-        self.q_spinor = np.zeros((self.dim_spinor, self.n_atoms), dtype=complex)
-        if self.include_exchange:
-            self.q_hole_spinor = np.zeros((self.n_occ_spinor, self.n_occ_spinor, self.n_atoms), dtype=complex)
-            self.q_elec_spinor = np.zeros((self.n_virt_spinor, self.n_virt_spinor, self.n_atoms), dtype=complex)
 
-        print(f"  -> Assembling transition density blocks (Atom-by-Atom via BLAS)...")
-        for A, (a0, a1) in enumerate(self.atom_ao_ranges):
-            Co_a = C_sp_occ_a[a0:a1, :]
-            SCo_a = SC_sp_occ_a[a0:a1, :]
-            Cv_a = C_sp_virt_a[a0:a1, :]
-            SCv_a = SC_sp_virt_a[a0:a1, :]
-            
-            Co_b = C_sp_occ_b[a0:a1, :]
-            SCo_b = SC_sp_occ_b[a0:a1, :]
-            Cv_b = C_sp_virt_b[a0:a1, :]
-            SCv_b = SC_sp_virt_b[a0:a1, :]
-            
-            # Ultra-Fast Native Spinor Projection
-            q_A_alpha = 0.5 * (Co_a.conj().T @ SCv_a + SCo_a.conj().T @ Cv_a)
-            q_A_beta  = 0.5 * (Co_b.conj().T @ SCv_b + SCo_b.conj().T @ Cv_b)
-            
-            self.q_spinor[:, A] = (q_A_alpha + q_A_beta).flatten()
-            
-            if self.include_exchange:
-                self.q_hole_spinor[:, :, A] = 0.5 * (Co_a.conj().T @ SCo_a + SCo_a.conj().T @ Co_a + Co_b.conj().T @ SCo_b + SCo_b.conj().T @ Co_b)
-                self.q_elec_spinor[:, :, A] = 0.5 * (Cv_a.conj().T @ SCv_a + SCv_a.conj().T @ Cv_a + Cv_b.conj().T @ SCv_b + SCv_b.conj().T @ Cv_b)
+        q_trans_a = np.einsum("ip,iaA,aq->pqA", U_occ_a.conj(), self.q_ov, U_virt_a, optimize=True)
+        q_trans_b = np.einsum("ip,iaA,aq->pqA", U_occ_b.conj(), self.q_ov, U_virt_b, optimize=True)
+        self.q_spinor = (q_trans_a + q_trans_b).reshape(self.dim_spinor, self.n_atoms)
+        del q_trans_a, q_trans_b
+
+        if self.include_exchange:
+            self.q_hole_spinor = (
+                np.einsum("ip,ijA,jq->pqA", U_occ_a.conj(), self.q_occ, U_occ_a, optimize=True)
+                + np.einsum("ip,ijA,jq->pqA", U_occ_b.conj(), self.q_occ, U_occ_b, optimize=True)
+            )
+            self.q_elec_spinor = (
+                np.einsum("ap,abA,bq->pqA", U_virt_a.conj(), self.q_virt, U_virt_a, optimize=True)
+                + np.einsum("ap,abA,bq->pqA", U_virt_b.conj(), self.q_virt, U_virt_b, optimize=True)
+            )
 
         if self.include_exchange:
             qe = self.q_elec_spinor.reshape(self.n_virt_spinor * self.n_virt_spinor, self.n_atoms)
             self.W_elec_spinor = (qe @ self.gamma.T).reshape(self.n_virt_spinor, self.n_virt_spinor, self.n_atoms)
 
-        print(f"  -> Density mappings compiled natively in {time.time() - t_sp:.2f}s")
+        print(f"  -> Density mappings compiled in {time.time() - t_sp:.2f}s")
 
         # 3. Spinor Zero-Order Energies
         eps_occ_sp = soc_E[0 : self.n_occ_spinor].copy()
