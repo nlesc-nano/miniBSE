@@ -1,31 +1,56 @@
+import os
 import numpy as np
 import time
 import sys
 from miniBSE.io_utils import get_vxc_ao_matrix
+from miniBSE.constants import HA_TO_EV
 
 class ExcitonHamiltonian:
     def __init__(self, C, eps, overlap, atom_ao_ranges, homo_index, n_occ, n_virt, scissor_ev, gamma_qp, gamma_bse, material=None, 
                  gamma_bare=None, gamma_penalty=None, alpha=1.0, include_exchange=False, estimate_qp=False, e_thresh=None, f_thresh=0.0, mu_ia_x=None, mu_ia_y=None, mu_ia_z=None, 
                  charge_type='mulliken', soc_U=None, soc_E=None, device="numpy", precomputed_sigma=None,
-                 vxc_ao_path=None, nthreads=1):
+                 vxc_ao_path=None, nthreads=1, spin='singlet', C_beta=None, eps_beta=None, homo_index_beta=None,
+                 n_occ_beta=None, n_virt_beta=None):
         
         self.include_exchange = include_exchange
         self.estimate_qp = estimate_qp
+        self.gamma_bse = gamma_bse
+        self.gamma_qp = gamma_qp
         self.gamma = gamma_bse
+        self.spin = spin
         self.material = material
         self.gamma_bare = gamma_bare
         self.gamma_penalty = gamma_penalty
         self.alpha = alpha
         self.soc_flag = (soc_U is not None and soc_E is not None)
         self.overlap = overlap                
-        self.atom_ao_ranges = atom_ao_ranges  
+        self.atom_ao_ranges = atom_ao_ranges
+
+        # --------------------------------------------------
+        # UKS SPIN-PRESERVING (Manifold B): Coupled alpha-alpha + beta-beta
+        # --------------------------------------------------
+        if spin == 'uks_spin_preserving':
+            self.init_uks_spin_preserving(
+                C_alpha=C, eps_alpha=eps, homo_index_alpha=homo_index, n_occ_alpha=n_occ, n_virt_alpha=n_virt,
+                C_beta=C_beta, eps_beta=eps_beta, homo_index_beta=homo_index_beta,
+                n_occ_beta=n_occ_beta if n_occ_beta is not None else n_occ,
+                n_virt_beta=n_virt_beta if n_virt_beta is not None else n_virt,
+                overlap=overlap, atom_ao_ranges=atom_ao_ranges, scissor_ev=scissor_ev,
+                e_thresh=e_thresh, f_thresh=f_thresh, mu_ia_x=mu_ia_x, mu_ia_y=mu_ia_y, mu_ia_z=mu_ia_z,
+                charge_type=charge_type, device=device, soc_U=soc_U, soc_E=soc_E
+            )
+            return
         
+        C_beta_or_alpha = C_beta if C_beta is not None else C
+        eps_beta_or_alpha = eps_beta if eps_beta is not None else eps
+        homo_index_beta = homo_index_beta if homo_index_beta is not None else homo_index
+
         occ_idx = np.arange(homo_index - n_occ + 1, homo_index + 1)
-        virt_idx = np.arange(homo_index + 1, homo_index + 1 + n_virt)
+        virt_idx = np.arange(homo_index_beta + 1, homo_index_beta + 1 + n_virt)
         n_occ_act, n_virt_act = len(occ_idx), len(virt_idx)
         
         e_min_occ, e_homo = eps[occ_idx[0]], eps[occ_idx[-1]]
-        e_lumo, e_max_virt = eps[virt_idx[0]], eps[virt_idx[-1]]
+        e_lumo, e_max_virt = eps_beta_or_alpha[virt_idx[0]], eps_beta_or_alpha[virt_idx[-1]]
 
         print(f"\n--- [4] Building Exciton Hamiltonian ---")
         print(f"  Energy Window Diagnostics:")
@@ -36,7 +61,7 @@ class ExcitonHamiltonian:
         # EXTRACT DENSE ACTIVE SPACE MATRICES
         # --------------------------------------------------
         C_occ_act = C[:, occ_idx]
-        C_virt_act = C[:, virt_idx]
+        C_virt_act = C_beta_or_alpha[:, virt_idx]
         if hasattr(C_occ_act, "toarray"): C_occ_act = C_occ_act.toarray()
         if hasattr(C_virt_act, "toarray"): C_virt_act = C_virt_act.toarray()
         
@@ -45,9 +70,10 @@ class ExcitonHamiltonian:
         self.C_orig_occ, self.C_orig_virt = C_occ_act, C_virt_act
         self.scissor_ev = scissor_ev
         self.n_atoms = len(atom_ao_ranges)
+        start_q = time.time()
 
         eps_occ_qp = eps[occ_idx].copy()
-        eps_virt_qp = eps[virt_idx].copy()
+        eps_virt_qp = eps_beta_or_alpha[virt_idx].copy()
         
         # --- MOVE DENSITY BUILDER UP FOR QP CORRECTIONS ---
         if self.include_exchange or self.soc_flag or (self.estimate_qp and precomputed_sigma is None):
@@ -118,45 +144,46 @@ class ExcitonHamiltonian:
                     q_act_occ_val[:, :, A] = 0.5 * (Co_act.T @ SCo_val + SCo_act.T @ Co_val)
                     q_act_virt_val[:, :, A] = 0.5 * (Cv_act.T @ SCo_val + SCv_act.T @ Co_val)
 
-                # EXACTLY your old math for the baseline
-                dW = self.gamma - self.gamma_bare  
-                W = self.gamma
+                # [EXPERIMENTAL] COHSEX self-energy — uses the QP-screened kernel (gamma_qp)
+                # for SEX and the difference kernel (gamma_qp - gamma_bare) for COH.
+                # This path is not used in production runs (use --qp_gap gw instead).
+                dW = self.gamma_qp - self.gamma_bare  
+                W = self.gamma_qp
                 
-                sigma_occ_raw = np.zeros(self.n_occ_act)
-                sigma_virt_raw = np.zeros(self.n_virt_act)
-                homo_coh, homo_sex, homo_sic = 0.0, 0.0, 0.0
-                lumo_coh, lumo_sex, lumo_sic = 0.0, 0.0, 0.0
+                # Fully Vectorized COHSEX Computation
+                q_occ_diag = np.array([self.q_occ[i, i, :] for i in range(self.n_occ_act)])
+                q_virt_diag = np.array([self.q_virt[a, a, :] for a in range(self.n_virt_act)])
 
-                # 1. Compute for Active Occupied Orbitals
-                for i in range(self.n_occ_act):
-                    q_ii = self.q_occ[i, i, :]
-                    coh = 0.5 * np.dot(q_ii, dW @ q_ii)
-                    sex = 0.0
-                    for j in range(n_valence_occ):
-                        q_ij = q_act_occ_val[i, j, :]
-                        sex -= np.dot(q_ij, W @ q_ij)
-                    
-                    # Apply the isolated Hubbard penalty (Push occupied DOWN)
-                    sic = np.dot(q_ii, self.gamma_penalty @ q_ii) if self.gamma_penalty is not None else 0.0
-                    sigma_occ_raw[i] = coh + sex - sic
-                    if i == self.n_occ_act - 1:
-                        homo_coh, homo_sex, homo_sic = coh, sex, sic
+                coh_occ = 0.5 * np.einsum('iA,AB,iB->i', q_occ_diag, dW, q_occ_diag, optimize=True)
+                Wq_occ = np.einsum('AB,ijB->ijA', W, q_act_occ_val, optimize=True)
+                sex_occ = -np.einsum('ijA,ijA->i', q_act_occ_val, Wq_occ, optimize=True)
+                
+                if self.gamma_penalty is not None:
+                    sic_occ = np.einsum('iA,AB,iB->i', q_occ_diag, self.gamma_penalty, q_occ_diag, optimize=True)
+                else:
+                    sic_occ = np.zeros(self.n_occ_act)
+                
+                sigma_occ_raw = coh_occ + sex_occ - sic_occ
+                
+                coh_virt = 0.5 * np.einsum('aA,AB,aB->a', q_virt_diag, dW, q_virt_diag, optimize=True)
+                Wq_virt = np.einsum('AB,ajB->ajA', W, q_act_virt_val, optimize=True)
+                sex_virt = -np.einsum('ajA,ajA->a', q_act_virt_val, Wq_virt, optimize=True)
+                
+                if self.gamma_penalty is not None:
+                    sic_virt = np.einsum('aA,AB,aB->a', q_virt_diag, self.gamma_penalty, q_virt_diag, optimize=True)
+                else:
+                    sic_virt = np.zeros(self.n_virt_act)
+                
+                sigma_virt_raw = coh_virt + sex_virt + sic_virt
 
-                # 2. Compute for Active Virtual Orbitals
-                for a in range(self.n_virt_act):
-                    q_aa = self.q_virt[a, a, :]
-                    coh = 0.5 * np.dot(q_aa, dW @ q_aa)
-                    sex = 0.0
-                    for j in range(n_valence_occ):
-                        q_aj = q_act_virt_val[a, j, :]
-                        sex -= np.dot(q_aj, W @ q_aj)
-                    
-                    # Apply the isolated Hubbard penalty (Push virtual UP)
-                    sic = np.dot(q_aa, self.gamma_penalty @ q_aa) if self.gamma_penalty is not None else 0.0
-                    sigma_virt_raw[a] = coh + sex + sic
-
-                    if a == 0:
-                        lumo_coh, lumo_sex, lumo_sic = coh, sex, sic
+                # Extract for diagnostics
+                homo_coh = coh_occ[-1]
+                homo_sex = sex_occ[-1]
+                homo_sic = sic_occ[-1]
+                
+                lumo_coh = coh_virt[0]
+                lumo_sex = sex_virt[0]
+                lumo_sic = sic_virt[0]
 
                 print(f"\n  [QP] Detailed Self-Energy Components:")
                 print(f"       HOMO COH: {homo_coh:8.4f} eV  |  SEX: {homo_sex:8.4f} eV  |  SIC: -{homo_sic:8.4f} eV")
@@ -181,22 +208,14 @@ class ExcitonHamiltonian:
                 print(f"       LUMO Top 5 Atom Charges (q): {q_lumo[top_lumo_atoms]}")
                 # -----------------------------------
                 # 3. Exact Vxc Correction from AO Matrix OR HOMO Referencing
-                import os
                 if vxc_ao_path is not None and os.path.exists(vxc_ao_path):
                     print("\n  [Vxc] Applying Exact State-Dependent Vxc Integrals...")
                     V_ao = get_vxc_ao_matrix(vxc_ao_path, self.overlap.shape[0])
                     
-                    vxc_occ = np.zeros(self.n_occ_act)
-                    for i in range(self.n_occ_act):
-                        c_i = self.C_orig_occ[:, i]
-                        vxc_occ[i] = c_i.T @ V_ao @ c_i
-                    
-                    vxc_virt = np.zeros(self.n_virt_act)
-                    for a in range(self.n_virt_act):
-                        c_a = self.C_orig_virt[:, a]
-                        vxc_virt[a] = c_a.T @ V_ao @ c_a
+                    # Fully Vectorized Vxc Projection
+                    vxc_occ = np.sum(self.C_orig_occ * (V_ao @ self.C_orig_occ), axis=0)
+                    vxc_virt = np.sum(self.C_orig_virt * (V_ao @ self.C_orig_virt), axis=0)
 
-                    HA_TO_EV = 27.211386
                     vxc_occ_ev = vxc_occ * HA_TO_EV
                     vxc_virt_ev = vxc_virt * HA_TO_EV
 
@@ -299,24 +318,8 @@ class ExcitonHamiltonian:
         print(f"    Final CI Space (Energy AND f0 >= {f_thresh}): {self.dim} valid transitions")
 
         # --------------------------------------------------
-        # EXTRACT DENSE ACTIVE SPACE MATRICES
-        # --------------------------------------------------
-        C_occ_act = C[:, occ_idx]
-        C_virt_act = C[:, virt_idx]
-        if hasattr(C_occ_act, "toarray"): C_occ_act = C_occ_act.toarray()
-        if hasattr(C_virt_act, "toarray"): C_virt_act = C_virt_act.toarray()
-        
-        self.occ_idx, self.virt_idx = occ_idx, virt_idx
-        self.n_occ_act, self.n_virt_act = n_occ_act, n_virt_act
-        self.C_orig_occ, self.C_orig_virt = C_occ_act, C_virt_act
-        self.scissor_ev = scissor_ev
-
-        # --------------------------------------------------
         # ULTRA-FAST Charge Construction
         # --------------------------------------------------
-        self.n_atoms = len(atom_ao_ranges)
-        start_q = time.time()
-        
         self.q_flat = np.zeros((self.dim, self.n_atoms), dtype=np.float32)
 
         if charge_type == 'mulliken':
@@ -355,6 +358,14 @@ class ExcitonHamiltonian:
                     SCi_A = SC_occ[a0:a1, :][:, self.valid_i]
                     self.q_flat[:, A] = 0.5 * (np.sum(Ci_A * SCa_A, axis=0) + np.sum(Ca_A * SCi_A, axis=0))
 
+        elif charge_type == 'lowdin':
+            print(f"  Building transition charges (Atom-by-Atom via Lowdin symmetric orthogonalization)...")
+            from miniBSE.lowdin import build_lowdin_transition_charges_flat
+            S_dense = overlap.toarray() if hasattr(overlap, "toarray") else overlap
+            self.q_flat = build_lowdin_transition_charges_flat(
+                C_occ_act, C_virt_act, S_dense, atom_ao_ranges, self.valid_i, self.valid_a
+            )
+
         print(f"    Charges built in {time.time() - start_q:2.4f} s")
 
         # --------------------------------------------------
@@ -362,6 +373,218 @@ class ExcitonHamiltonian:
         # --------------------------------------------------
         if self.soc_flag:
             self.build_spinor_basis(soc_U, soc_E, e_thresh)
+
+    def init_uks_spin_preserving(self, C_alpha, eps_alpha, homo_index_alpha, n_occ_alpha, n_virt_alpha,
+                                   C_beta, eps_beta, homo_index_beta, n_occ_beta, n_virt_beta,
+                                   overlap, atom_ao_ranges, scissor_ev, e_thresh, f_thresh,
+                                   mu_ia_x, mu_ia_y, mu_ia_z, charge_type, device, soc_U=None, soc_E=None):
+        """
+        Manifold B: Coupled spin-preserving excitations for an open-shell UKS reference.
+        Alpha transitions (alpha_occ -> alpha_virt) and beta transitions (beta_occ -> beta_virt)
+        are coupled by the spin-independent Coulomb interaction J.
+        Exchange K is block-diagonal: K_alpha acts only within alpha transitions, K_beta only within beta.
+        """
+        print(f"\n--- [4] Building Exciton Hamiltonian (UKS Spin-Preserving, Manifold B) ---")
+        n_atoms = len(atom_ao_ranges)
+        self.n_atoms = n_atoms
+        self.scissor_ev = 0.0  # will be consumed into D below
+
+        if C_beta is None:
+            raise ValueError("UKS spin-preserving mode requires C_beta (beta MOs).")
+        if hasattr(C_alpha, 'toarray'): C_alpha = C_alpha.toarray()
+        if hasattr(C_beta, 'toarray'): C_beta = C_beta.toarray()
+
+        # ---- Alpha channel active space ----
+        occ_idx_a  = np.arange(homo_index_alpha - n_occ_alpha + 1, homo_index_alpha + 1)
+        virt_idx_a = np.arange(homo_index_alpha + 1, homo_index_alpha + 1 + n_virt_alpha)
+        C_occ_a  = C_alpha[:, occ_idx_a]
+        C_virt_a = C_alpha[:, virt_idx_a]
+        eps_occ_a  = eps_alpha[occ_idx_a].copy()
+        eps_virt_a = eps_alpha[virt_idx_a].copy()
+        # Apply scissor to virtual alpha energies
+        eps_virt_a += scissor_ev
+
+        # ---- Beta channel active space ----
+        occ_idx_b  = np.arange(homo_index_beta - n_occ_beta + 1, homo_index_beta + 1)
+        virt_idx_b = np.arange(homo_index_beta + 1, homo_index_beta + 1 + n_virt_beta)
+        C_occ_b  = C_beta[:, occ_idx_b]
+        C_virt_b = C_beta[:, virt_idx_b]
+        eps_occ_b  = eps_beta[occ_idx_b].copy()
+        eps_virt_b = eps_beta[virt_idx_b].copy()
+        # Apply scissor to virtual beta energies
+        eps_virt_b += scissor_ev
+
+        n_occ_a, n_virt_a = len(occ_idx_a), len(virt_idx_a)
+        n_occ_b, n_virt_b = len(occ_idx_b), len(virt_idx_b)
+
+        print(f"  Alpha channel: {n_occ_a} occ x {n_virt_a} virt = {n_occ_a * n_virt_a} transitions")
+        print(f"  Beta  channel: {n_occ_b} occ x {n_virt_b} virt = {n_occ_b * n_virt_b} transitions")
+
+        # Store for later use in solver / analysis
+        self.n_occ_act   = n_occ_a   # primary (alpha) sizes for compatibility
+        self.n_virt_act  = n_virt_a
+        self.n_occ_act_b = n_occ_b
+        self.n_virt_act_b = n_virt_b
+        self.homo_index_alpha = homo_index_alpha
+        self.homo_index_beta  = homo_index_beta
+        self.occ_idx_a, self.virt_idx_a = occ_idx_a, virt_idx_a
+        self.occ_idx_b, self.virt_idx_b = occ_idx_b, virt_idx_b
+        self.C_orig_occ  = C_occ_a
+        self.C_orig_virt = C_virt_a
+        self.C_orig_occ_b = C_occ_b
+        self.C_orig_virt_b = C_virt_b
+        self.sigma_occ_a = np.zeros(n_occ_a)
+        self.sigma_virt_a = np.full(n_virt_a, scissor_ev)
+        self.sigma_occ_b = np.zeros(n_occ_b)
+        self.sigma_virt_b = np.full(n_virt_b, scissor_ev)
+        self.sigma_occ = self.sigma_occ_a
+        self.sigma_virt = self.sigma_virt_a
+
+        # ---- Compute raw orbital energy gaps (DFT, for threshold filtering) ----
+        dft_gap_a = eps_alpha[virt_idx_a].reshape(1, -1) - eps_alpha[occ_idx_a].reshape(-1, 1)
+        dft_gap_b = eps_beta[virt_idx_b].reshape(1, -1)  - eps_beta[occ_idx_b].reshape(-1, 1)
+
+        # ---- Apply e_thresh mask ----
+        mask_e_a = (dft_gap_a <= e_thresh) if e_thresh is not None else np.ones_like(dft_gap_a, dtype=bool)
+        mask_e_b = (dft_gap_b <= e_thresh) if e_thresh is not None else np.ones_like(dft_gap_b, dtype=bool)
+
+        # ---- Oscillator strength pre-filter (alpha block only, beta assigned zero) ----
+        if f_thresh > 0.0 and mu_ia_x is not None:
+            mu_x_a, mu_x_b = mu_ia_x
+            mu_y_a, mu_y_b = mu_ia_y
+            mu_z_a, mu_z_b = mu_ia_z
+            gap_au_a = dft_gap_a / 27.211386
+            f_ia_0_a = (4.0 / 3.0) * gap_au_a * (mu_x_a**2 + mu_y_a**2 + mu_z_a**2)
+            mask_f_a = f_ia_0_a >= f_thresh
+            gap_au_b = dft_gap_b / 27.211386
+            f_ia_0_b = (4.0 / 3.0) * gap_au_b * (mu_x_b**2 + mu_y_b**2 + mu_z_b**2)
+            mask_f_b = f_ia_0_b >= f_thresh
+        else:
+            mask_f_a = np.ones_like(dft_gap_a, dtype=bool)
+            mask_f_b = np.ones_like(dft_gap_b, dtype=bool)
+
+        valid_mask_a = mask_e_a & mask_f_a
+        valid_mask_b = mask_e_b & mask_f_b
+        vi_a, va_a = np.where(valid_mask_a)
+        vi_b, va_b = np.where(valid_mask_b)
+        dim_a, dim_b = len(vi_a), len(vi_b)
+
+        if (dim_a + dim_b) == 0:
+            print(f"ERROR: UKS spin-preserving CI space is empty! e_thresh ({e_thresh}) is too strict.")
+            sys.exit(1)
+
+        print(f"  Alpha transitions after threshold: {dim_a}")
+        print(f"  Beta  transitions after threshold: {dim_b}")
+        print(f"  Total CI dimension: {dim_a + dim_b}")
+
+        # Store valid indices for both channels
+        self.valid_i,   self.valid_a   = vi_a, va_a   # alpha (legacy compat)
+        self.valid_mask                 = valid_mask_a
+        self.vi_a, self.va_a           = vi_a, va_a
+        self.vi_b, self.va_b           = vi_b, va_b
+        self.dim_a, self.dim_b         = dim_a, dim_b
+        self.dim = dim_a + dim_b
+
+        # ---- QP diagonal (use QP-corrected energies with scissor applied) ----
+        qp_gap_a = eps_virt_a.reshape(1, -1) - eps_occ_a.reshape(-1, 1)
+        qp_gap_b = eps_virt_b.reshape(1, -1) - eps_occ_b.reshape(-1, 1)
+        D_a = qp_gap_a[valid_mask_a]
+        D_b = qp_gap_b[valid_mask_b]
+        self.D_spatial = np.concatenate([D_a, D_b])
+        self.D = self.D_spatial
+
+        print(f"  Alpha energy range: {D_a.min():.3f} – {D_a.max():.3f} eV" if dim_a else "  Alpha: no transitions")
+        print(f"  Beta  energy range: {D_b.min():.3f} – {D_b.max():.3f} eV" if dim_b else "  Beta:  no transitions")
+
+        # ---- Build transition charges (concatenated, flat) ----
+        start_q = time.time()
+        S = overlap.toarray() if hasattr(overlap, 'toarray') else overlap
+
+        if charge_type == 'mulliken':
+            print(f"  Building Mulliken transition charges (alpha + beta channels)...")
+            SC_occ_a  = S @ C_occ_a
+            SC_virt_a = S @ C_virt_a
+            SC_occ_b  = S @ C_occ_b
+            SC_virt_b = S @ C_virt_b
+            sc_built = True
+
+            q_flat_a = np.zeros((dim_a, n_atoms), dtype=np.float32)
+            q_flat_b = np.zeros((dim_b, n_atoms), dtype=np.float32)
+
+            for A, (a0, a1) in enumerate(atom_ao_ranges):
+                if dim_a:
+                    Ci_A  = C_occ_a[a0:a1, :][:, vi_a]
+                    SCa_A = SC_virt_a[a0:a1, :][:, va_a]
+                    Ca_A  = C_virt_a[a0:a1, :][:, va_a]
+                    SCi_A = SC_occ_a[a0:a1, :][:, vi_a]
+                    q_flat_a[:, A] = 0.5 * (np.sum(Ci_A * SCa_A, axis=0) + np.sum(Ca_A * SCi_A, axis=0))
+                if dim_b:
+                    Ci_B  = C_occ_b[a0:a1, :][:, vi_b]
+                    SCa_B = SC_virt_b[a0:a1, :][:, va_b]
+                    Ca_B  = C_virt_b[a0:a1, :][:, va_b]
+                    SCi_B = SC_occ_b[a0:a1, :][:, vi_b]
+                    q_flat_b[:, A] = 0.5 * (np.sum(Ci_B * SCa_B, axis=0) + np.sum(Ca_B * SCi_B, axis=0))
+
+        elif charge_type == 'lowdin':
+            print(f"  Building Löwdin transition charges (alpha + beta channels)...")
+            from miniBSE.lowdin import build_lowdin_transition_charges_flat
+            q_flat_a = build_lowdin_transition_charges_flat(C_occ_a, C_virt_a, S, atom_ao_ranges, vi_a, va_a) if dim_a else np.zeros((0, n_atoms), dtype=np.float32)
+            q_flat_b = build_lowdin_transition_charges_flat(C_occ_b, C_virt_b, S, atom_ao_ranges, vi_b, va_b) if dim_b else np.zeros((0, n_atoms), dtype=np.float32)
+            sc_built = False
+        else:
+            raise ValueError(f"Unknown charge_type '{charge_type}'. Use 'mulliken' or 'lowdin'.")
+
+        # Concatenate into unified flat charge array [dim_a + dim_b, n_atoms]
+        self.q_flat   = np.concatenate([q_flat_a, q_flat_b], axis=0).astype(np.float32)
+        self.q_flat_a = q_flat_a
+        self.q_flat_b = q_flat_b
+        print(f"    Charges built in {time.time() - start_q:.4f} s")
+
+        # ---- Build full channel density blocks for exchange and/or SOC rotation ----
+        if self.include_exchange or self.soc_flag:
+            print(f"  Building same-spin density blocks...")
+            t_ex = time.time()
+            # Compute S@C products if not already done (e.g. lowdin path skipped them)
+            if not sc_built:
+                SC_occ_a  = S @ C_occ_a
+                SC_virt_a = S @ C_virt_a
+                SC_occ_b  = S @ C_occ_b
+                SC_virt_b = S @ C_virt_b
+            # Alpha block: q_occ_a[i,j,A] and q_virt_a[a,b,A]
+            self.q_occ_a  = np.zeros((n_occ_a, n_occ_a, n_atoms))
+            self.q_virt_a = np.zeros((n_virt_a, n_virt_a, n_atoms))
+            self.q_ov_a = np.zeros((n_occ_a, n_virt_a, n_atoms))
+            for A, (a0, a1) in enumerate(atom_ao_ranges):
+                Co  = C_occ_a[a0:a1, :]
+                SCo = SC_occ_a[a0:a1, :]
+                self.q_occ_a[:, :, A] = 0.5 * (Co.T @ SCo + SCo.T @ Co)
+                Cv  = C_virt_a[a0:a1, :]
+                SCv = SC_virt_a[a0:a1, :]
+                self.q_virt_a[:, :, A] = 0.5 * (Cv.T @ SCv + SCv.T @ Cv)
+                self.q_ov_a[:, :, A] = 0.5 * (Co.T @ SCv + SCo.T @ Cv)
+            # Beta block
+            self.q_occ_b  = np.zeros((n_occ_b, n_occ_b, n_atoms))
+            self.q_virt_b = np.zeros((n_virt_b, n_virt_b, n_atoms))
+            self.q_ov_b = np.zeros((n_occ_b, n_virt_b, n_atoms))
+            for A, (a0, a1) in enumerate(atom_ao_ranges):
+                Co  = C_occ_b[a0:a1, :]
+                SCo = SC_occ_b[a0:a1, :]
+                self.q_occ_b[:, :, A] = 0.5 * (Co.T @ SCo + SCo.T @ Co)
+                Cv  = C_virt_b[a0:a1, :]
+                SCv = SC_virt_b[a0:a1, :]
+                self.q_virt_b[:, :, A] = 0.5 * (Cv.T @ SCv + SCv.T @ Cv)
+                self.q_ov_b[:, :, A] = 0.5 * (Co.T @ SCv + SCo.T @ Cv)
+
+            # Pre-contract screened virtual blocks  W = gamma @ q_virt
+            if self.include_exchange:
+                qva = self.q_virt_a.reshape(n_virt_a * n_virt_a, n_atoms)
+                self.W_virt_a = (qva @ self.gamma.T).reshape(n_virt_a, n_virt_a, n_atoms)
+                qvb = self.q_virt_b.reshape(n_virt_b * n_virt_b, n_atoms)
+                self.W_virt_b = (qvb @ self.gamma.T).reshape(n_virt_b, n_virt_b, n_atoms)
+            print(f"    Same-spin density blocks built in {time.time() - t_ex:.4f} s")
+
+        if self.soc_flag:
+            self.build_spinor_basis_uks(soc_U, soc_E, e_thresh)
 
     def build_spinor_basis(self, U_mo, soc_E, e_thresh):
         print("\n--- [SOC] Transforming Exciton Hamiltonian to Spinor Basis ---")
@@ -464,10 +687,114 @@ class ExcitonHamiltonian:
         print(f"  -> BSE Active Space expanded to {self.dim_spinor_full} spinor transitions.")
         print(f"  -> Truncated Spinor Space (Energy <= {e_thresh} eV): {self.dim} valid transitions")
 
+    def build_spinor_basis_uks(self, U_mo, soc_E, e_thresh):
+        print("\n--- [SOC-UKS] Transforming Exciton Hamiltonian to Spinor Basis ---")
+        n_alpha = self.n_occ_act + self.n_virt_act
+        n_beta = self.n_occ_act_b + self.n_virt_act_b
+        self.n_occ_spinor = self.n_occ_act + self.n_occ_act_b
+        self.n_virt_spinor = self.n_virt_act + self.n_virt_act_b
+        self.dim_spinor = self.n_occ_spinor * self.n_virt_spinor
+        self.dim = self.dim_spinor
+        self.soc_U = U_mo
+
+        occ_cols = slice(0, self.n_occ_spinor)
+        virt_cols = slice(self.n_occ_spinor, self.n_occ_spinor + self.n_virt_spinor)
+
+        U_occ_a = U_mo[0:self.n_occ_act, occ_cols]
+        U_virt_a = U_mo[self.n_occ_act:n_alpha, virt_cols]
+        U_occ_b = U_mo[n_alpha:n_alpha + self.n_occ_act_b, occ_cols]
+        U_virt_b = U_mo[n_alpha + self.n_occ_act_b:n_alpha + n_beta, virt_cols]
+
+        print("  -> Rotating UKS alpha/beta charge tensors into the spinor basis...")
+        t_sp = time.time()
+        q_trans_a = np.einsum("ip,iaA,aq->pqA", U_occ_a.conj(), self.q_ov_a, U_virt_a, optimize=True)
+        q_trans_b = np.einsum("ip,iaA,aq->pqA", U_occ_b.conj(), self.q_ov_b, U_virt_b, optimize=True)
+        self.q_spinor = (q_trans_a + q_trans_b).reshape(self.dim_spinor, self.n_atoms)
+
+        if self.include_exchange:
+            self.q_hole_spinor = (
+                np.einsum("ip,ijA,jq->pqA", U_occ_a.conj(), self.q_occ_a, U_occ_a, optimize=True)
+                + np.einsum("ip,ijA,jq->pqA", U_occ_b.conj(), self.q_occ_b, U_occ_b, optimize=True)
+            )
+            self.q_elec_spinor = (
+                np.einsum("ap,abA,bq->pqA", U_virt_a.conj(), self.q_virt_a, U_virt_a, optimize=True)
+                + np.einsum("ap,abA,bq->pqA", U_virt_b.conj(), self.q_virt_b, U_virt_b, optimize=True)
+            )
+            qe = self.q_elec_spinor.reshape(self.n_virt_spinor * self.n_virt_spinor, self.n_atoms)
+            self.W_elec_spinor = (qe @ self.gamma.T).reshape(self.n_virt_spinor, self.n_virt_spinor, self.n_atoms)
+
+        print(f"  -> UKS density mappings compiled in {time.time() - t_sp:.2f}s")
+
+        eps_occ_sp = soc_E[:self.n_occ_spinor].copy()
+        eps_virt_sp = soc_E[self.n_occ_spinor:self.n_occ_spinor + self.n_virt_spinor].copy()
+        raw_gap_spinor_dft = (eps_virt_sp.reshape(1, -1) - eps_occ_sp.reshape(-1, 1)).flatten()
+
+        sigma_occ_sp = np.concatenate([self.sigma_occ_a, self.sigma_occ_b])
+        sigma_virt_sp = np.concatenate([self.sigma_virt_a, self.sigma_virt_b])
+
+        eps_occ_sp += sigma_occ_sp
+        eps_virt_sp += sigma_virt_sp
+
+        raw_gap_spinor_qp = (eps_virt_sp.reshape(1, -1) - eps_occ_sp.reshape(-1, 1)).flatten()
+        raw_D_spinor = raw_gap_spinor_qp + self.scissor_ev
+
+        if e_thresh is not None:
+            self.valid_spinor_mask = raw_gap_spinor_dft <= e_thresh
+        else:
+            self.valid_spinor_mask = np.ones_like(raw_D_spinor, dtype=bool)
+
+        self.valid_spinor_idx = np.where(self.valid_spinor_mask)[0]
+        self.D_spinor = raw_D_spinor[self.valid_spinor_mask]
+        self.q_spinor = self.q_spinor[self.valid_spinor_mask, :]
+        self.D = self.D_spinor
+
+        self.dim_spinor_full = len(raw_D_spinor)
+        self.dim = len(self.D_spinor)
+        print(f"  -> UKS BSE Active Space expanded to {self.dim_spinor_full} spinor transitions.")
+        print(f"  -> Truncated UKS Spinor Space (Energy <= {e_thresh} eV): {self.dim} valid transitions")
+
     def matvec(self, x):
         """Matrix-vector product for Davidson Solver."""
         
         if not self.soc_flag:
+            if getattr(self, 'spin', 'singlet') == 'triplet':
+                # === TRIPLET SPATIAL MATVEC ===
+                y = self.D_spatial * x
+                # No J term
+                if self.include_exchange:
+                    x_mat = np.zeros((self.n_occ_act, self.n_virt_act))
+                    x_mat[self.valid_i, self.valid_a] = x
+                    K = np.einsum("ijA, abA, jb -> ia", self.q_occ, self.W_virt, x_mat, optimize=True)
+                    y -= 1.0 * K[self.valid_i, self.valid_a]
+                return y
+
+            if getattr(self, 'spin', 'singlet') == 'uks_spin_preserving':
+                # === UKS SPIN-PRESERVING MATVEC (Manifold B) ===
+                # Diagonal term
+                y = self.D_spatial * x
+
+                # Full Coulomb J (spin-independent, couples all alpha and beta transitions)
+                # Factor is 1.0 (we are explicit in spin-channel space, no 2x factor)
+                T = self.q_flat.T @ x          # [n_atoms]
+                y += 1.0 * self.q_flat @ (self.gamma @ T)
+
+                if self.include_exchange:
+                    # Alpha block: K_alpha applied to x_alpha part
+                    x_a = x[:self.dim_a]
+                    x_mat_a = np.zeros((self.n_occ_act, self.n_virt_act))
+                    x_mat_a[self.vi_a, self.va_a] = x_a
+                    K_a = np.einsum("ijA, abA, jb -> ia", self.q_occ_a, self.W_virt_a, x_mat_a, optimize=True)
+                    y[:self.dim_a] -= K_a[self.vi_a, self.va_a]
+
+                    # Beta block: K_beta applied to x_beta part
+                    x_b = x[self.dim_a:]
+                    x_mat_b = np.zeros((self.n_occ_act_b, self.n_virt_act_b))
+                    x_mat_b[self.vi_b, self.va_b] = x_b
+                    K_b = np.einsum("ijA, abA, jb -> ia", self.q_occ_b, self.W_virt_b, x_mat_b, optimize=True)
+                    y[self.dim_a:] -= K_b[self.vi_b, self.va_b]
+
+                return y
+
             # === STANDARD SPATIAL MATVEC (Singlets) ===
             y = self.D_spatial * x
             T = self.q_flat.T @ x
@@ -511,10 +838,53 @@ class ExcitonHamiltonian:
 
     def get_transition_dipoles(self, mu_ia_x, mu_ia_y, mu_ia_z):
         """Extracts transition dipoles in either the spatial or spinor basis."""
+        if getattr(self, 'spin', 'singlet') == 'triplet':
+            return np.zeros((self.dim, 3))
+
+        if getattr(self, 'spin', 'singlet') == 'uks_spin_preserving' and not self.soc_flag:
+            # mu_ia_x/y/z are tuples: (mu_alpha, mu_beta)
+            mu_x_a, mu_x_b = mu_ia_x
+            mu_y_a, mu_y_b = mu_ia_y
+            mu_z_a, mu_z_b = mu_ia_z
+            mu_a = np.zeros((self.dim_a, 3))
+            mu_b = np.zeros((self.dim_b, 3))
+            if self.dim_a:
+                mu_a[:, 0] = mu_x_a[self.vi_a, self.va_a]
+                mu_a[:, 1] = mu_y_a[self.vi_a, self.va_a]
+                mu_a[:, 2] = mu_z_a[self.vi_a, self.va_a]
+            if self.dim_b:
+                mu_b[:, 0] = mu_x_b[self.vi_b, self.va_b]
+                mu_b[:, 1] = mu_y_b[self.vi_b, self.va_b]
+                mu_b[:, 2] = mu_z_b[self.vi_b, self.va_b]
+            return np.concatenate([mu_a, mu_b], axis=0)
+
         if not self.soc_flag:
             mu_ia = np.zeros((len(self.valid_i), 3))
             mu_ia[:, 0], mu_ia[:, 1], mu_ia[:, 2] = mu_ia_x[self.valid_i, self.valid_a], mu_ia_y[self.valid_i, self.valid_a], mu_ia_z[self.valid_i, self.valid_a]
             return mu_ia
+
+        if getattr(self, 'spin', 'singlet') == 'uks_spin_preserving':
+            n_alpha = self.n_occ_act + self.n_virt_act
+            occ_cols = slice(0, self.n_occ_spinor)
+            virt_cols = slice(self.n_occ_spinor, self.n_occ_spinor + self.n_virt_spinor)
+            U_occ_a = self.soc_U[0:self.n_occ_act, occ_cols]
+            U_virt_a = self.soc_U[self.n_occ_act:n_alpha, virt_cols]
+            U_occ_b = self.soc_U[n_alpha:n_alpha + self.n_occ_act_b, occ_cols]
+            U_virt_b = self.soc_U[n_alpha + self.n_occ_act_b:n_alpha + self.n_occ_act_b + self.n_virt_act_b, virt_cols]
+
+            mu_x_a, mu_x_b = mu_ia_x
+            mu_y_a, mu_y_b = mu_ia_y
+            mu_z_a, mu_z_b = mu_ia_z
+
+            def map_dipole_uks(mu_a, mu_b):
+                mu_sp = U_occ_a.conj().T @ mu_a @ U_virt_a + U_occ_b.conj().T @ mu_b @ U_virt_b
+                return mu_sp.flatten()[self.valid_spinor_mask] if hasattr(self, 'valid_spinor_mask') else mu_sp.flatten()
+
+            return np.column_stack((
+                map_dipole_uks(mu_x_a, mu_x_b),
+                map_dipole_uks(mu_y_a, mu_y_b),
+                map_dipole_uks(mu_z_a, mu_z_b),
+            ))
             
         # Fast memory-free mapping for dipoles using U directly via matrix multiplication
         k = self.n_occ_act + self.n_virt_act
@@ -527,4 +897,4 @@ class ExcitonHamiltonian:
             mu_sp = U_occ_a.conj().T @ mu_spatial @ U_virt_a + U_occ_b.conj().T @ mu_spatial @ U_virt_b
             return mu_sp.flatten()[self.valid_spinor_mask] if hasattr(self, 'valid_spinor_mask') else mu_sp.flatten()
 
-        return np.column_stack((map_dipole(mu_ia_x), map_dipole(mu_ia_y), map_dipole(mu_ia_z)))
+        return np.column_stack((map_dipole(mu_ia_x), map_dipole(mu_ia_y), map_dipole(map_dipole(mu_ia_z) if False else mu_ia_z)))

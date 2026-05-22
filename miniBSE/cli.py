@@ -13,16 +13,19 @@ import libint_cpp
 
 from miniBSE.io_utils import (
     read_xyz, parse_basis, build_shell_dicts,
-    count_ao_from_shells, build_atom_ao_ranges, read_mos_auto
+    count_ao_from_shells, build_atom_ao_ranges, read_mos_auto, read_mos_uks
 )
 from miniBSE.solver import ExcitonSolver
-from miniBSE.constants import HA_TO_EV
+from miniBSE.constants import HA_TO_EV, BOHR_PER_ANG
 from miniBSE.exciton_analysis import ExcitonAnalyzer, plot_analysis_summary
 from miniBSE.integrals import compute_dipole_ao
 from miniBSE.oscillator import compute_oscillator_strengths
 from miniBSE.hardness import MATERIAL_DB, estimate_brus_qp_gap, estimate_gw_qp_gap
-from miniBSE.orbital_analysis import compute_spin_character, print_orbital_summary
-from miniBSE.fuzzy_bands import run_fuzzy_bands_and_pdos, build_qp_energies
+from miniBSE.orbital_analysis import (
+    compute_spin_character, compute_uks_soc_spin_character,
+    format_spin_character, infer_reference_spin, print_orbital_summary
+)
+from miniBSE.fuzzy_bands import run_fuzzy_bands_and_pdos, build_qp_energies, build_qp_energies_vacuum
 from miniBSE.nto import run_nto_analysis
 
 
@@ -64,9 +67,12 @@ def print_qp_provenance(details, dft_gap=None, target_qp_gap=None, output_file=N
 
     print("\n  [QP Provenance] Scaled-GW hardness dictionary model")
     print(f"    Material                 : {details['material']}")
-    print(f"    Cluster radius           : {details['cluster_radius_ang']:.3f} Å")
+    if "cluster_radius_ang" in details:
+        print(f"    Cluster radius           : {details['cluster_radius_ang']:.3f} Å")
     print(f"    Bulk PBE -> GW gap       : {details['bulk_pbe_gap_ev']:.3f} -> {details['bulk_gw_gap_ev']:.3f} eV")
     print(f"    Bulk GW shift            : {details['bulk_gw_shift_ev']:+.3f} eV")
+    if details.get("periodic_bulk_limit"):
+        print("    Periodic mode            : using tabulated bulk GW-PBE scissor only")
     if details.get("has_monomer_anchor"):
         print(f"    Monomer anchor radius    : {details['monomer_radius_ang']:.3f} Å")
         print(f"    Monomer PBE -> GW gap    : {details['monomer_pbe_gap_ev']:.3f} -> {details['monomer_gw_gap_ev']:.3f} eV")
@@ -104,9 +110,44 @@ def write_qp_provenance(details, dft_gap, target_qp_gap, scissor, args, filename
         f.write("\n")
     return filename
 
+
+def estimate_periodic_bulk_gw_scissor(material_name):
+    if material_name is None:
+        return None, None
+    m_name = material_name.upper()
+    entry = MATERIAL_DB.get(m_name)
+    if entry is None or len(entry) < 9:
+        return None, None
+
+    gap_pbe_bulk = float(entry[7])
+    gap_gw_bulk = float(entry[8])
+    scissor = gap_gw_bulk - gap_pbe_bulk
+    details = {
+        "qp_model": "bulk_gw_hardness_dictionary",
+        "periodic_bulk_limit": True,
+        "material": m_name,
+        "bulk_pbe_gap_ev": gap_pbe_bulk,
+        "bulk_gw_gap_ev": gap_gw_bulk,
+        "bulk_gw_shift_ev": scissor,
+        "has_monomer_anchor": False,
+        "finite_size_shift_vacuum_ev": 0.0,
+        "finite_size_shift_solvent_ev": 0.0,
+        "total_scissor_vacuum_ev": scissor,
+        "total_scissor_solvent_ev": scissor,
+    }
+    return scissor, details
+
 def run_solver_and_analysis(solver, coords_ang, syms, shells, mu_ia_x, mu_ia_y, mu_ia_z, dft_gap, scissor, confinement_energy, args, suffix="", soc_gap=None, soc_U=None, soc_E=None):
     """Encapsulates the solving, printing, analysis, and exporting."""
-    label = "SOC" if solver.soc_flag else "SPIN-FREE"
+    spin = getattr(solver.ham, 'spin', 'singlet')
+    if solver.soc_flag:
+        label = "SOC"
+    elif spin == 'uks_spin_preserving':
+        label = "UKS SPIN-PRESERVING"
+    elif spin == 'triplet':
+        label = "TRIPLET (SPIN-FLIP)"
+    else:
+        label = "SPIN-FREE"
     print(f"\n===================================================")
     print(f" [ {label} ] EXCITON CALCULATION ")
     print(f"===================================================")
@@ -121,6 +162,38 @@ def run_solver_and_analysis(solver, coords_ang, syms, shells, mu_ia_x, mu_ia_y, 
 
     mu_ia = solver.ham.get_transition_dipoles(mu_ia_x, mu_ia_y, mu_ia_z)
     f_strengths = compute_oscillator_strengths(energies_ev, vectors, mu_ia, is_spinor=solver.soc_flag)
+
+    def project_spinor_vec_to_spatial(vec):
+        X_IA = np.zeros(solver.ham.dim_spinor_full, dtype=complex)
+        if hasattr(solver.ham, 'valid_spinor_idx'):
+            X_IA[solver.ham.valid_spinor_idx] = vec
+        else:
+            X_IA = vec
+        X_IA = X_IA.reshape(solver.ham.n_occ_spinor, solver.ham.n_virt_spinor)
+
+        if getattr(solver.ham, 'spin', 'singlet') == 'uks_spin_preserving':
+            n_alpha = solver.ham.n_occ_act + solver.ham.n_virt_act
+            occ_cols = slice(0, solver.ham.n_occ_spinor)
+            virt_cols = slice(solver.ham.n_occ_spinor, solver.ham.n_occ_spinor + solver.ham.n_virt_spinor)
+            U_occ_a = soc_U[0:solver.ham.n_occ_act, occ_cols]
+            U_virt_a = soc_U[solver.ham.n_occ_act:n_alpha, virt_cols]
+            U_occ_b = soc_U[n_alpha:n_alpha + solver.ham.n_occ_act_b, occ_cols]
+            U_virt_b = soc_U[n_alpha + solver.ham.n_occ_act_b:n_alpha + solver.ham.n_occ_act_b + solver.ham.n_virt_act_b, virt_cols]
+            X_a = U_occ_a.conj() @ X_IA @ U_virt_a.T
+            X_b = U_occ_b.conj() @ X_IA @ U_virt_b.T
+            return np.concatenate([
+                np.abs(X_a[solver.ham.vi_a, solver.ham.va_a]),
+                np.abs(X_b[solver.ham.vi_b, solver.ham.va_b]),
+            ])
+
+        n_mo = soc_U.shape[0] // 2
+        n_occ_sp = solver.ham.n_occ_spinor
+        U_occ_a = soc_U[:n_mo, :n_occ_sp]
+        U_virt_a = soc_U[:n_mo, n_occ_sp:]
+        U_occ_b = soc_U[n_mo:, :n_occ_sp]
+        U_virt_b = soc_U[n_mo:, n_occ_sp:]
+        X_ia = U_occ_a.conj() @ X_IA @ U_virt_a.T + U_occ_b.conj() @ X_IA @ U_virt_b.T
+        return np.abs(X_ia[solver.ham.valid_i, solver.ham.valid_a])
 
     print("\n" + "-"*60)
     print(f" SYSTEM ENERGY SUMMARY ({label})")
@@ -149,6 +222,19 @@ def run_solver_and_analysis(solver, coords_ang, syms, shells, mu_ia_x, mu_ia_y, 
             h_lbl = f"spH" if abs_h == n_occ_sp else f"spH-{n_occ_sp - abs_h}"
             e_lbl = f"spL" if abs_e == n_occ_sp + 1 else f"spL+{abs_e - (n_occ_sp + 1)}"
             trans_str = f"{h_lbl}->{e_lbl}"
+        elif getattr(solver.ham, 'spin', 'singlet') == 'uks_spin_preserving':
+            # Determine which channel the dominant transition belongs to
+            idx_dom = np.argmax(np.abs(vectors[:, n]))
+            if idx_dom < solver.ham.dim_a:
+                # Alpha channel
+                abs_h = (solver.ham.homo_index_alpha - solver.ham.n_occ_act + 1) + hole_idx
+                abs_e = (solver.ham.homo_index_alpha + 1) + elec_idx
+                trans_str = f"{abs_h:3d}->{abs_e:3d}(α)"
+            else:
+                # Beta channel
+                abs_h = (solver.ham.homo_index_beta - solver.ham.n_occ_act_b + 1) + hole_idx
+                abs_e = (solver.ham.homo_index_beta + 1) + elec_idx
+                trans_str = f"{abs_h:3d}->{abs_e:3d}(β)"
         else:
             abs_h = (solver.homo_index - solver.ham.n_occ_act + 1) + hole_idx
             abs_e = (solver.homo_index + 1) + elec_idx
@@ -165,7 +251,14 @@ def run_solver_and_analysis(solver, coords_ang, syms, shells, mu_ia_x, mu_ia_y, 
 
         pr = 1.0 / np.sum(np.abs(vec)**4)
 
-        if solver.soc_flag:
+        if solver.soc_flag and getattr(solver.ham, 'spin', 'singlet') == 'uks_spin_preserving':
+            sectors, _ = compute_uks_soc_spin_character(
+                vec, solver.ham, soc_U,
+                getattr(args, "n_alpha_ref", 0.0),
+                getattr(args, "n_beta_ref", 0.0)
+            )
+            spin_str = format_spin_character(sectors)
+        elif solver.soc_flag:
             soc_mask = None
             if args.e_thresh is not None and soc_E is not None:
                 n_occ_sp = solver.ham.n_occ_spinor
@@ -196,24 +289,7 @@ def run_solver_and_analysis(solver, coords_ang, syms, shells, mu_ia_x, mu_ia_y, 
         
         # Project spinor back to spatial for Dreuw-Plasser natively
         if solver.soc_flag:
-            X_IA = np.zeros(solver.ham.dim_spinor_full, dtype=complex)
-            if hasattr(solver.ham, 'valid_spinor_idx'):
-                X_IA[solver.ham.valid_spinor_idx] = vec
-            else:
-                X_IA = vec
-            X_IA = X_IA.reshape(solver.ham.n_occ_spinor, solver.ham.n_virt_spinor)
-            
-            n_mo = soc_U.shape[0] // 2
-            n_occ_sp = solver.ham.n_occ_spinor
-            
-            U_occ_a = soc_U[:n_mo, :n_occ_sp]
-            U_virt_a = soc_U[:n_mo, n_occ_sp:]
-            U_occ_b = soc_U[n_mo:, :n_occ_sp]
-            U_virt_b = soc_U[n_mo:, n_occ_sp:]
-            
-            X_ia = U_occ_a.conj() @ X_IA @ U_virt_a.T + U_occ_b.conj() @ X_IA @ U_virt_b.T
-            vec_spatial_complex = X_ia[solver.ham.valid_i, solver.ham.valid_a]
-            vec_spatial = np.abs(vec_spatial_complex)
+            vec_spatial = project_spinor_vec_to_spatial(vec)
         else:
             vec_spatial = vec
 
@@ -259,17 +335,7 @@ def run_solver_and_analysis(solver, coords_ang, syms, shells, mu_ia_x, mu_ia_y, 
         for idx in top_indices:
             raw_vec = vectors[:, idx]
             if solver.soc_flag:
-                X_IA = np.zeros(solver.ham.dim_spinor_full, dtype=complex)
-                if hasattr(solver.ham, 'valid_spinor_idx'): X_IA[solver.ham.valid_spinor_idx] = raw_vec
-                else: X_IA = raw_vec
-                X_IA = X_IA.reshape(solver.ham.n_occ_spinor, solver.ham.n_virt_spinor)
-                
-                n_mo = soc_U.shape[0] // 2
-                n_occ_sp = solver.ham.n_occ_spinor
-                
-                X_ia = soc_U[:n_mo, :n_occ_sp].conj() @ X_IA @ soc_U[:n_mo, n_occ_sp:].T + \
-                       soc_U[n_mo:, :n_occ_sp].conj() @ X_IA @ soc_U[n_mo:, n_occ_sp:].T
-                cube_vec = np.abs(X_ia[solver.ham.valid_i, solver.ham.valid_a])
+                cube_vec = project_spinor_vec_to_spatial(raw_vec)
             else:
                 cube_vec = raw_vec
             
@@ -337,6 +403,58 @@ def run_solver_and_analysis(solver, coords_ang, syms, shells, mu_ia_x, mu_ia_y, 
         plot_analysis_summary(analysis_results, physics_metrics=metrics, filename=plot_file, show=args.show, broadening=args.broadening, sigma=args.sigma)
 
 
+def validate_args(args, parser):
+    if args.e_thresh is not None and (args.nhomos is not None or args.nlumos is not None):
+        parser.error("Conflict: Please specify either energy threshold selection (--e_thresh) OR direct active space count (--nhomos / --nlumos), but not both.")
+        
+    if args.soc_flag and args.gth_file is None:
+        parser.error("Validation error: --soc_flag requires a GTH pseudopotential file via --gth_file.")
+        
+    if args.run_fuzzy and args.cif is None:
+        parser.error("Validation error: --run_fuzzy requires a CIF crystal structure file via --cif.")
+
+    if getattr(args, "periodic_enabled", False):
+        lattice_vectors = getattr(args, "lattice_vectors", None)
+        if lattice_vectors is None:
+            parser.error("Validation error: periodic.enabled requires periodic.lattice_vectors in the YAML config.")
+        lattice = np.asarray(lattice_vectors, dtype=float)
+        if lattice.shape != (3, 3):
+            parser.error("Validation error: periodic.lattice_vectors must be a 3x3 list of vectors in angstrom.")
+
+
+def _apply_config(args, config_data):
+    for section, parameters in config_data.items():
+        if section == "periodic" and isinstance(parameters, dict):
+            setattr(args, "periodic_enabled", bool(parameters.get("enabled", False)))
+            if "lattice_vectors" in parameters:
+                setattr(args, "lattice_vectors", parameters["lattice_vectors"])
+            if "overlap_cutoff" in parameters:
+                setattr(args, "overlap_cutoff", parameters["overlap_cutoff"])
+            continue
+
+        if isinstance(parameters, dict):
+            for key, value in parameters.items():
+                setattr(args, key, value)
+        else:
+            setattr(args, section, parameters)
+
+
+def _select_soc_window_indices(eps_shifted, homo_index, soc_window):
+    eps_shifted = np.asarray(eps_shifted)
+    if soc_window is None or soc_window <= 0:
+        return np.arange(len(eps_shifted), dtype=int)
+
+    mask_idx = np.where(np.abs(eps_shifted) <= float(soc_window))[0]
+    if mask_idx.size == 0:
+        start = max(0, homo_index)
+        stop = min(len(eps_shifted), homo_index + 2)
+    else:
+        start = min(int(mask_idx[0]), max(0, homo_index))
+        stop = max(int(mask_idx[-1]) + 1, min(len(eps_shifted), homo_index + 2))
+
+    return np.arange(start, stop, dtype=int)
+        
+
 def main():
     parser = argparse.ArgumentParser(description="miniBSE - Lightweight post-DFT exciton solver")
 
@@ -375,10 +493,19 @@ def main():
     parser.add_argument("--cube", action="store_true")
     parser.add_argument("--cube-spacing", type=float, default=0.5)
     parser.add_argument("--disable_cpp_cube", action="store_true")
-    parser.add_argument("--nhomos", type=int, default=2, help="Number of HOMO states (spatial or spinor) to export")
-    parser.add_argument("--nlumos", type=int, default=2, help="Number of LUMO states (spatial or spinor) to export")
+    parser.add_argument("--cube-nhomos", type=int, default=2, dest="cube_nhomos", help="Number of HOMO states (spatial or spinor) to export")
+    parser.add_argument("--cube-nlumos", type=int, default=2, dest="cube_nlumos", help="Number of LUMO states (spatial or spinor) to export")
     parser.add_argument("--nbse", type=int, default=3, help="Number of Top Exciton states to export if bse_states is not provided")
     parser.add_argument("--bse_states", type=int, nargs='+', help="Specific exciton states to plot (1-indexed, e.g., 2 9 19)")
+    
+    # --- BSE Active Space Arguments ---
+    parser.add_argument("--nhomos", type=int, default=None, help="Number of occupied MOs to include in the BSE active space")
+    parser.add_argument("--nlumos", type=int, default=None, help="Number of virtual MOs to include in the BSE active space")
+    parser.add_argument("--charge_type", choices=["mulliken", "lowdin"], default="mulliken", help="Method to compute transition charges (Mulliken or Lowdin).")
+
+    # --- Triplet State / UKS Arguments ---
+    parser.add_argument("--triplet", action="store_true", help="Perform triplet state BSE calculations")
+    parser.add_argument("--mo_file_beta", type=str, default=None, help="Path to molecular orbitals file for beta spin channel (UKS triplet)")
     # ----------------------
     
     parser.add_argument("--write-csv", action="store_true")
@@ -410,6 +537,12 @@ def main():
     parser.add_argument("--fold_to_bz", action="store_true", help="Fold fuzzy-band weights into the first Brillouin zone by summing reciprocal replicas.")
     parser.add_argument("--g_shell", type=int, default=0, help="Reciprocal-vector shell for folded fuzzy-band weights; 0, 1, and 2 use 1, 27, and 125 replicas.")
     parser.add_argument("--dashboard_energy_mode", choices=["dft", "qp", "both"], default="dft", help="Generate fuzzy dashboards on DFT, QP-corrected, or both energy axes.")
+    parser.add_argument("--qp_energy_reference", choices=["vacuum", "fermi"], default="vacuum", help="Energy reference for QP fuzzy dashboards.")
+
+    # Periodic/Gamma-only arguments. YAML is the preferred interface.
+    parser.add_argument("--periodic", action="store_true", dest="periodic_enabled", help="Use Gamma-only periodic AO overlap.")
+    parser.add_argument("--lattice_vectors", type=float, nargs=9, default=None, help="3x3 lattice vectors in angstrom, row-major.")
+    parser.add_argument("--overlap_cutoff", type=float, default=-1.0, help="Periodic overlap image cutoff in angstrom; <=0 uses minimum image only.")
 
     args = parser.parse_args()
 
@@ -417,14 +550,14 @@ def main():
     if args.config:
         with open(args.config, 'r') as f:
             config_data = yaml.safe_load(f)
-            
-        for section, parameters in config_data.items():
-            if isinstance(parameters, dict):
-                for key, value in parameters.items(): setattr(args, key, value)
-            else:
-                setattr(args, section, parameters)
+
+        _apply_config(args, config_data or {})
+
+    if getattr(args, "lattice_vectors", None) is not None:
+        args.lattice_vectors = np.asarray(args.lattice_vectors, dtype=float).reshape(3, 3).tolist()
 
     setup_run_logging(getattr(args, "log_file", "minibse.log"))
+    validate_args(args, parser)
     if config_path:
         print(f"Loading configuration from {config_path}...")
 
@@ -448,26 +581,69 @@ def main():
 
     print("\n--- Computing AO overlap ---")
     t0_s = time.time()
-    S = libint_cpp.overlap(shells, args.nthreads)
-    print(f"  ->  Overlap computed in {time.time() - t0_s:.2f} s")
+    if getattr(args, "periodic_enabled", False):
+        lattice_ang = np.asarray(args.lattice_vectors, dtype=float)
+        lattice_bohr = lattice_ang * BOHR_PER_ANG
+        cutoff = float(getattr(args, "overlap_cutoff", -1.0))
+        if cutoff <= 0.0:
+            print("  [Warning] periodic.overlap_cutoff <= 0 uses minimum-image overlap only.")
+            print("  [Warning] Gamma-periodic MO orthonormality usually requires summing neighboring cell images; try overlap_cutoff: 6.0.")
+        S = libint_cpp.overlap_pbc(shells, lattice_bohr, cutoff, args.nthreads)
+        print(f"  ->  PBC overlap computed in {time.time() - t0_s:.2f} s")
+        print(f"  ->  Lattice vectors read from YAML in angstrom; Libint lattice passed in bohr. cutoff={cutoff:.3f} A")
+    else:
+        S = libint_cpp.overlap(shells, args.nthreads)
+        print(f"  ->  Finite-system overlap computed in {time.time() - t0_s:.2f} s")
 
-    print(f"\n--- Reading Molecular Orbitals from {args.mo_file} ---")
-    t0_mos = time.time()
-    C, eps, occ = read_mos_auto(args.mo_file, n_ao, verbose=True)
-    print(f"  -> MOs parsed in {time.time() - t0_mos:.2f} s | C shape {C.shape}")
+    C_beta, eps_beta, occ_beta = None, None, None
+    homo_index_beta = None
+
+    if args.mo_file_beta is not None:
+        print(f"\n--- Reading Alpha Molecular Orbitals from {args.mo_file} ---")
+        t0_mos = time.time()
+        C, eps, occ = read_mos_auto(args.mo_file, n_ao, verbose=True)
+        print(f"  -> Alpha MOs parsed in {time.time() - t0_mos:.2f} s | C shape {C.shape}")
+        
+        print(f"\n--- Reading Beta Molecular Orbitals from {args.mo_file_beta} ---")
+        t0_beta = time.time()
+        C_beta, eps_beta, occ_beta = read_mos_auto(args.mo_file_beta, n_ao, verbose=True)
+        print(f"  -> Beta MOs parsed in {time.time() - t0_beta:.2f} s | C shape {C_beta.shape}")
+    else:
+        print(f"\n--- Reading Molecular Orbitals from {args.mo_file} ---")
+        t0_mos = time.time()
+        C, eps, occ = read_mos_auto(args.mo_file, n_ao, verbose=True)
+        print(f"  -> MOs parsed in {time.time() - t0_mos:.2f} s | C shape {C.shape}")
 
     t0_gap = time.time()
     homo_index = np.where(occ > 0.0)[0].max()
     eps = eps * HA_TO_EV
     
+    if eps_beta is not None:
+        homo_index_beta = np.where(occ_beta > 0.0)[0].max()
+        eps_beta = eps_beta * HA_TO_EV
+    else:
+        homo_index_beta = homo_index
+        eps_beta = eps
+
+    args.n_alpha_ref = float(np.sum(occ))
+    args.n_beta_ref = float(np.sum(occ_beta)) if occ_beta is not None else float(np.sum(occ))
+    args.S_ref = infer_reference_spin(args.n_alpha_ref, args.n_beta_ref)
+    if C_beta is not None:
+        print(
+            f"  [Spin] UKS reference: N_alpha={args.n_alpha_ref:.1f}, "
+            f"N_beta={args.n_beta_ref:.1f}, S_ref~{args.S_ref:.1f}, "
+            f"multiplicity~{int(round(2 * args.S_ref + 1))}"
+        )
+
     # Define Shifted Energy Axis
     e_fermi_raw = (eps[homo_index] + eps[homo_index + 1]) / 2.0
     eps_shifted = eps - e_fermi_raw
+    eps_beta_shifted = eps_beta - e_fermi_raw
     e_homo = eps_shifted[homo_index]
-    e_lumo = eps_shifted[homo_index + 1]
+    e_lumo = eps_beta_shifted[homo_index_beta + 1]
 
     # REPLACE IT WITH THIS:
-    dft_gap = eps[homo_index + 1] - eps[homo_index]
+    dft_gap = eps_beta[homo_index_beta + 1] - eps[homo_index]
     target_qp_gap = dft_gap
     confinement_energy = 0.0
     qp_provenance = None
@@ -484,10 +660,14 @@ def main():
                 target_qp_gap = dft_gap
                 
         elif args.qp_gap.lower() == "gw":
-            # Compute the Scaled GW Scissor directly
-            gw_scissor, qp_provenance = estimate_gw_qp_gap(
-                np.array(coords_ang), syms, args.material, args.eps_out, return_details=True
-            )
+            if getattr(args, "periodic_enabled", False):
+                print("\n  [Bulk GW Model] Periodic mode enabled: using tabulated bulk GW-PBE scissor.")
+                gw_scissor, qp_provenance = estimate_periodic_bulk_gw_scissor(args.material)
+            else:
+                # Compute the Scaled GW Scissor directly
+                gw_scissor, qp_provenance = estimate_gw_qp_gap(
+                    np.array(coords_ang), syms, args.material, args.eps_out, return_details=True
+                )
             
             if gw_scissor is not None:
                 scissor = gw_scissor
@@ -519,8 +699,19 @@ def main():
     dft_lumo_raw = eps[homo_index + 1]
     
     entry = MATERIAL_DB.get(args.material.upper(), None)
-    
-    if entry is not None and len(entry) >= 14:
+
+    if getattr(args, "periodic_enabled", False):
+        f_homo, f_lumo = 0.0, 1.0
+        qp_homo = dft_homo_raw
+        qp_lumo = dft_lumo_raw + scissor
+
+        print(f"\n  [Periodic Band Edges]")
+        print(f"    Raw CP2K HOMO    : {dft_homo_raw:8.4f} eV (arbitrary periodic eigenvalue zero)")
+        print(f"    Raw CP2K LUMO    : {dft_lumo_raw:8.4f} eV")
+        print(f"    Bulk GW scissor  : virtual manifold shifted by {scissor:+.4f} eV")
+        print("    Note             : absolute IP/EA levels are not assigned in periodic mode.")
+
+    elif entry is not None and len(entry) >= 14:
         pbe_h_mono, pbe_l_mono, gw_h_mono, gw_l_mono = entry[10], entry[11], entry[12], entry[13]
         gap_pbe_mono = pbe_l_mono - pbe_h_mono
         
@@ -558,8 +749,12 @@ def main():
         print(f"    Raw CP2K HOMO    : {dft_homo_raw:8.4f} eV")
         print(f"    -> Shift Split   : HOMO takes 50.0%, LUMO takes 50.0% (Default)")
 
-    print(f"    QP HOMO (IP)     : {qp_homo:8.4f} eV   -> IP = {-qp_homo:8.4f} eV")
-    print(f"    QP LUMO (EA)     : {qp_lumo:8.4f} eV   -> EA = {-qp_lumo:8.4f} eV")
+    if getattr(args, "periodic_enabled", False):
+        print(f"    QP HOMO-like     : {qp_homo:8.4f} eV (relative eigenvalue)")
+        print(f"    QP LUMO-like     : {qp_lumo:8.4f} eV (relative eigenvalue)")
+    else:
+        print(f"    QP HOMO (IP)     : {qp_homo:8.4f} eV   -> IP = {-qp_homo:8.4f} eV")
+        print(f"    QP LUMO (EA)     : {qp_lumo:8.4f} eV   -> EA = {-qp_lumo:8.4f} eV")
     # =========================================================================
 
     print(f"  -> Energy axis shifted and target gap resolved in {time.time() - t0_gap:.4f} s")
@@ -573,12 +768,20 @@ def main():
     SC_dense = S @ C_dense 
     
     # === DIAGNOSTIC: STRICT C^T S C ORTHONORMALITY CHECK ===
-    print("\n  [Diag] Testing MO Orthonormality (C^T S C = I) ...")
+    overlap_label = "PBC" if getattr(args, "periodic_enabled", False) else "finite"
+    print(f"\n  [Diag] Testing MO Orthonormality with {overlap_label} overlap (C^T S C = I) ...")
     norm_matrix = C_dense.T @ SC_dense
-    diags = np.diag(norm_matrix)
     orth_err = np.linalg.norm(norm_matrix - np.eye(C_dense.shape[1]))
+    print(f"[CHECK] alpha ||CᵀSC - I|| = {orth_err:.3e}")
 
-    print(f"[CHECK] ||CᵀSC - I|| = {orth_err:.3e}")
+    if C_beta is not None:
+        C_dense_beta_diag = C_beta.toarray() if hasattr(C_beta, 'toarray') else np.asarray(C_beta)
+        SC_dense_beta_diag = S @ C_dense_beta_diag
+        norm_matrix_beta = C_dense_beta_diag.T @ SC_dense_beta_diag
+        orth_err_beta = np.linalg.norm(norm_matrix_beta - np.eye(C_dense_beta_diag.shape[1]))
+        print(f"[CHECK] beta  ||CᵀSC - I|| = {orth_err_beta:.3e}")
+        cross_err = np.linalg.norm(C_dense.T @ SC_dense_beta_diag)
+        print(f"[CHECK] alpha/beta ||Caᵀ S Cb|| = {cross_err:.3e} (diagnostic)")
     # ===========================================================
 
     pops_sf = np.real(C_dense.conj() * SC_dense)
@@ -587,28 +790,48 @@ def main():
     # -----------------------------------------------------------------
     # BSE Active Space Setup
     # -----------------------------------------------------------------
+    is_uks_sp = (C_beta is not None) and (not args.triplet)
     if args.e_thresh is not None:
-        raw_gap = eps[homo_index + 1:].reshape(1, -1) - eps[:homo_index + 1].reshape(-1, 1)
+        raw_gap = eps_beta_shifted[homo_index_beta + 1:].reshape(1, -1) - eps_shifted[:homo_index + 1].reshape(-1, 1)
         valid_pairs = raw_gap <= args.e_thresh
         bse_n_occ = homo_index - np.where(np.any(valid_pairs, axis=1))[0][0] + 1
         bse_n_virt = np.where(np.any(valid_pairs, axis=0))[0][-1] + 1
     else:
-        bse_n_occ, bse_n_virt = args.n_occ, args.n_virt
+        bse_n_occ = args.nhomos if args.nhomos is not None else 25
+        bse_n_virt = args.nlumos if args.nlumos is not None else 25
+
+    # Safe bound active space sizes to avoid out of bounds
+    bse_n_occ = min(bse_n_occ, homo_index + 1)
+    bse_n_virt = min(bse_n_virt, len(eps) - (homo_index + 1), len(eps_beta) - (homo_index_beta + 1))
+    bse_n_occ_beta = min(bse_n_occ, homo_index_beta + 1)
+    bse_n_virt_beta = min(bse_n_virt, len(eps_beta) - (homo_index_beta + 1))
 
     bse_active_indices = np.arange(homo_index - bse_n_occ + 1, homo_index + 1 + bse_n_virt)
+    bse_active_indices_beta = np.arange(homo_index_beta - bse_n_occ_beta + 1, homo_index_beta + 1 + bse_n_virt_beta)
     bse_soc_E, bse_soc_U, bse_spinor_homo_idx = None, None, None
     calculated_soc_gap = None
     
     if args.soc_flag:
         print(f"\n--- Computing SOC Spinor Subspace for BSE (Small Window) ---")
-        from miniBSE.soc_utils import compute_spinor_subspace
-        bse_soc_E, bse_soc_U = compute_spinor_subspace(
-            atom_symbols=syms, coords_ang=coords_ang, shells=shells, 
-            C_AO=C_dense, eps_Ha=eps / HA_TO_EV, S_AO=S, 
-            active_indices=bse_active_indices, gth_file=args.gth_file, nthreads=args.nthreads
-        )
+        if is_uks_sp:
+            from miniBSE.soc_utils import compute_spinor_subspace_uks
+            C_dense_beta = C_beta.toarray() if hasattr(C_beta, 'toarray') else np.asarray(C_beta)
+            bse_soc_E, bse_soc_U = compute_spinor_subspace_uks(
+                atom_symbols=syms, coords_ang=coords_ang, shells=shells,
+                C_alpha_AO=C_dense, eps_alpha_Ha=eps / HA_TO_EV, active_alpha_indices=bse_active_indices,
+                C_beta_AO=C_dense_beta, eps_beta_Ha=eps_beta / HA_TO_EV, active_beta_indices=bse_active_indices_beta,
+                S_AO=S, gth_file=args.gth_file, nthreads=args.nthreads
+            )
+            bse_spinor_homo_idx = bse_n_occ + bse_n_occ_beta - 1
+        else:
+            from miniBSE.soc_utils import compute_spinor_subspace
+            bse_soc_E, bse_soc_U = compute_spinor_subspace(
+                atom_symbols=syms, coords_ang=coords_ang, shells=shells, 
+                C_AO=C_dense, eps_Ha=eps / HA_TO_EV, S_AO=S, 
+                active_indices=bse_active_indices, gth_file=args.gth_file, nthreads=args.nthreads
+            )
+            bse_spinor_homo_idx = (bse_n_occ * 2) - 1
         bse_soc_E = (bse_soc_E * HA_TO_EV) - e_fermi_raw
-        bse_spinor_homo_idx = (bse_n_occ * 2) - 1
         bse_soc_E -= (bse_soc_E[bse_spinor_homo_idx] + bse_soc_E[bse_spinor_homo_idx + 1]) / 2.0
 
     print("\n--- Spin-Free MO Population Analysis ---")
@@ -619,15 +842,27 @@ def main():
         print("\n--- SOC Spinor Population Analysis (BSE Active Space) ---")
         t_pop = time.time()
         
-        C_act = C_dense[:, bse_active_indices]
-        SC_act = SC_dense[:, bse_active_indices]
-        
-        n_mo_act = len(bse_active_indices)
-        C_spinor_act_alpha = C_act @ bse_soc_U[:n_mo_act, :]
-        C_spinor_act_beta  = C_act @ bse_soc_U[n_mo_act:, :]
-        
-        SC_spinor_act_alpha = SC_act @ bse_soc_U[:n_mo_act, :]
-        SC_spinor_act_beta  = SC_act @ bse_soc_U[n_mo_act:, :]
+        if is_uks_sp:
+            C_dense_beta = C_beta.toarray() if hasattr(C_beta, 'toarray') else np.asarray(C_beta)
+            SC_dense_beta = S @ C_dense_beta
+            C_act = C_dense[:, bse_active_indices]
+            C_act_beta = C_dense_beta[:, bse_active_indices_beta]
+            SC_act = SC_dense[:, bse_active_indices]
+            SC_act_beta = SC_dense_beta[:, bse_active_indices_beta]
+            n_mo_act = len(bse_active_indices)
+            n_mo_act_beta = len(bse_active_indices_beta)
+            C_spinor_act_alpha = C_act @ bse_soc_U[:n_mo_act, :]
+            C_spinor_act_beta  = C_act_beta @ bse_soc_U[n_mo_act:n_mo_act + n_mo_act_beta, :]
+            SC_spinor_act_alpha = SC_act @ bse_soc_U[:n_mo_act, :]
+            SC_spinor_act_beta  = SC_act_beta @ bse_soc_U[n_mo_act:n_mo_act + n_mo_act_beta, :]
+        else:
+            C_act = C_dense[:, bse_active_indices]
+            SC_act = SC_dense[:, bse_active_indices]
+            n_mo_act = len(bse_active_indices)
+            C_spinor_act_alpha = C_act @ bse_soc_U[:n_mo_act, :]
+            C_spinor_act_beta  = C_act @ bse_soc_U[n_mo_act:, :]
+            SC_spinor_act_alpha = SC_act @ bse_soc_U[:n_mo_act, :]
+            SC_spinor_act_beta  = SC_act @ bse_soc_U[n_mo_act:, :]
         
         pops_soc_act = np.real(C_spinor_act_alpha.conj() * SC_spinor_act_alpha) + \
                        np.real(C_spinor_act_beta.conj() * SC_spinor_act_beta)
@@ -684,8 +919,8 @@ def main():
         dummy = DummySolver()
         mo_list = []
         spinor_list = []
-        n_h = getattr(args, 'nhomos', 2)
-        n_l = getattr(args, 'nlumos', 2)
+        n_h = getattr(args, 'cube_nhomos', 2)
+        n_l = getattr(args, 'cube_nlumos', 2)
        
         # ALWAYS generate Spin-Free MOs
         mo_homo = dummy.homo_index
@@ -713,28 +948,60 @@ def main():
     # MODULE DELEGATION: FUZZY BANDS & PDOS (Large Window)
     # -----------------------------------------------------------------
     if getattr(args, 'run_fuzzy', False):
-        fuzzy_mask = np.abs(eps_shifted) <= args.soc_window
-        fuzzy_active_indices = np.where(fuzzy_mask)[0]
+        fuzzy_active_indices = _select_soc_window_indices(eps_shifted, homo_index, args.soc_window)
+        fuzzy_active_indices_beta = _select_soc_window_indices(eps_beta_shifted, homo_index_beta, args.soc_window)
+
+        qp_occ_shift_abs = qp_homo - eps[homo_index]
+        qp_virt_shift_abs = qp_lumo - eps_beta[homo_index_beta + 1]
+        qp_energies_abs = build_qp_energies_vacuum(eps, homo_index, occ_shift=qp_occ_shift_abs, virt_shift=qp_virt_shift_abs)
+        qp_energies_beta_abs = build_qp_energies_vacuum(eps_beta, homo_index_beta, occ_shift=qp_occ_shift_abs, virt_shift=qp_virt_shift_abs)
+        qp_energies_rel = build_qp_energies(eps_shifted, homo_index, scissor_ev=scissor)
+        qp_energies_beta_rel = build_qp_energies(eps_beta_shifted, homo_index_beta, scissor_ev=scissor)
         
-        fuzzy_soc_E, fuzzy_soc_U, fuzzy_spinor_homo_idx = None, None, None
+        fuzzy_soc_E, fuzzy_soc_E_abs, fuzzy_soc_U, fuzzy_spinor_homo_idx = None, None, None, None
         if args.soc_flag:
-            print(f"\n--- Computing SOC Spinor Subspace for Fuzzy Bands (Large Window: ±{args.soc_window} eV) ---")
-            from miniBSE.soc_utils import compute_spinor_subspace
-            fuzzy_soc_E, fuzzy_soc_U = compute_spinor_subspace(
-                atom_symbols=syms, coords_ang=coords_ang, shells=shells, 
-                C_AO=C_dense, eps_Ha=eps / HA_TO_EV, S_AO=S, 
-                active_indices=fuzzy_active_indices, gth_file=args.gth_file, nthreads=args.nthreads
-            )
-            fuzzy_soc_E = (fuzzy_soc_E * HA_TO_EV) - e_fermi_raw
-            f_n_occ = np.sum(fuzzy_active_indices <= homo_index)
-            fuzzy_spinor_homo_idx = (f_n_occ * 2) - 1
+            print(f"\n--- Computing SOC Spinor Subspace for Fuzzy Bands (|E-Ef| <= {args.soc_window:.3f} eV) ---")
+            print(f"  -> Alpha fuzzy SOC active MOs: {len(fuzzy_active_indices)} / {len(eps)}")
+            if is_uks_sp:
+                print(f"  -> Beta fuzzy SOC active MOs : {len(fuzzy_active_indices_beta)} / {len(eps_beta)}")
+            if is_uks_sp:
+                from miniBSE.soc_utils import compute_spinor_subspace_uks
+                C_dense_beta = C_beta.toarray() if hasattr(C_beta, 'toarray') else np.asarray(C_beta)
+                fuzzy_soc_E, fuzzy_soc_U = compute_spinor_subspace_uks(
+                    atom_symbols=syms, coords_ang=coords_ang, shells=shells,
+                    C_alpha_AO=C_dense, eps_alpha_Ha=eps / HA_TO_EV, active_alpha_indices=fuzzy_active_indices,
+                    C_beta_AO=C_dense_beta, eps_beta_Ha=eps_beta / HA_TO_EV, active_beta_indices=fuzzy_active_indices_beta,
+                    S_AO=S, gth_file=args.gth_file, nthreads=args.nthreads
+                )
+                f_n_occ = np.sum(fuzzy_active_indices <= homo_index)
+                f_n_occ_beta = np.sum(fuzzy_active_indices_beta <= homo_index_beta)
+                fuzzy_spinor_homo_idx = f_n_occ + f_n_occ_beta - 1
+            else:
+                from miniBSE.soc_utils import compute_spinor_subspace
+                fuzzy_soc_E, fuzzy_soc_U = compute_spinor_subspace(
+                    atom_symbols=syms, coords_ang=coords_ang, shells=shells, 
+                    C_AO=C_dense, eps_Ha=eps / HA_TO_EV, S_AO=S, 
+                    active_indices=fuzzy_active_indices, gth_file=args.gth_file, nthreads=args.nthreads
+                )
+                f_n_occ = np.sum(fuzzy_active_indices <= homo_index)
+                fuzzy_spinor_homo_idx = (f_n_occ * 2) - 1
+            fuzzy_soc_E_abs = fuzzy_soc_E * HA_TO_EV
+            fuzzy_soc_E = fuzzy_soc_E_abs - e_fermi_raw
             fuzzy_soc_E -= (fuzzy_soc_E[fuzzy_spinor_homo_idx] + fuzzy_soc_E[fuzzy_spinor_homo_idx + 1]) / 2.0
 
         run_fuzzy_bands_and_pdos(
             args, C_dense, S, eps_shifted, occ, homo_index, e_homo, e_lumo, e_fermi_raw, 
             syms, coords_ang, shells, pops_sf, 
             soc_active_indices=fuzzy_active_indices, soc_E_act=fuzzy_soc_E, soc_U_act=fuzzy_soc_U, spinor_homo_idx=fuzzy_spinor_homo_idx,
-            qp_energies=build_qp_energies(eps_shifted, homo_index, scissor_ev=scissor)
+            qp_energies=qp_energies_rel,
+            eps_abs=eps, qp_energies_abs=qp_energies_abs, soc_E_abs_act=fuzzy_soc_E_abs,
+            C_beta_dense=(C_beta.toarray() if hasattr(C_beta, 'toarray') else np.asarray(C_beta)) if is_uks_sp else None,
+            eps_beta_shifted=eps_beta_shifted if is_uks_sp else None,
+            eps_beta_abs=eps_beta if is_uks_sp else None,
+            homo_index_beta=homo_index_beta if is_uks_sp else None,
+            qp_energies_beta=qp_energies_beta_rel if is_uks_sp else None,
+            qp_energies_beta_abs=qp_energies_beta_abs if is_uks_sp else None,
+            soc_active_indices_beta=fuzzy_active_indices_beta if is_uks_sp else None
         )
 
 
@@ -751,6 +1018,9 @@ def main():
     # BSE CONTINUATION (Only if run_bse is True)
     # -----------------------------------------------------------------
     print("\n--- Computing Transition Dipoles ---")
+    if getattr(args, "periodic_enabled", False):
+        print("  [Warning] Periodic mode is enabled, but transition dipoles use the finite-cell AO position operator.")
+        print("  [Warning] Oscillator strengths should be treated as Gamma-only finite-cell approximations.")
     t0_dip = time.time()
     mu_ao_x, mu_ao_y, mu_ao_z = compute_dipole_ao(shells, nthreads=args.nthreads)
     print(f"  ->  Dipoles computed in {time.time() - t0_dip:.2f} s")
@@ -767,18 +1037,66 @@ def main():
             torch.set_num_threads(args.nthreads)
         except ImportError: pass
 
-    C_occ = C[:, homo_index - bse_n_occ + 1 : homo_index + 1].astype(np.float32)
-    C_virt = C[:, homo_index + 1 : homo_index + 1 + bse_n_virt].astype(np.float32)
+    # ---------------------------------------------------------------
+    # Determine spin mode and compute transition dipoles accordingly
+    # ---------------------------------------------------------------
+    is_uks_sp = (C_beta is not None) and (not args.triplet)
+    spin_mode = 'uks_spin_preserving' if is_uks_sp else ('triplet' if args.triplet else 'singlet')
 
-    def transform_dipole(mu_ao):
-        half_transformed = mu_ao.astype(np.float32) @ C_virt 
-        if compute_device in ["cuda", "mps"]:
-            import torch
-            dev = torch.device(compute_device)
-            return (torch.tensor(C_occ, device=dev).T @ torch.tensor(half_transformed, device=dev)).cpu().numpy().astype(np.float64)
-        return (C_occ.T @ half_transformed).astype(np.float64)
+    if is_uks_sp:
+        # Manifold B: compute alpha and beta dipoles separately and pass as tuples
+        print("  [UKS Spin-Preserving] Computing alpha-alpha and beta-beta transition dipoles separately...")
+        C_dense_alpha = C.toarray() if hasattr(C, 'toarray') else np.asarray(C)
+        C_dense_beta  = C_beta.toarray() if hasattr(C_beta, 'toarray') else np.asarray(C_beta)
 
-    mu_ia_x, mu_ia_y, mu_ia_z = transform_dipole(mu_ao_x), transform_dipole(mu_ao_y), transform_dipole(mu_ao_z)
+        C_occ_a  = C_dense_alpha[:, homo_index - bse_n_occ + 1 : homo_index + 1].astype(np.float32)
+        C_virt_a = C_dense_alpha[:, homo_index + 1 : homo_index + 1 + bse_n_virt].astype(np.float32)
+        C_occ_b  = C_dense_beta[:, homo_index_beta - bse_n_occ + 1 : homo_index_beta + 1].astype(np.float32)
+        C_virt_b = C_dense_beta[:, homo_index_beta + 1 : homo_index_beta + 1 + bse_n_virt].astype(np.float32)
+
+        def transform_dipole_chan(mu_ao, C_occ_ch, C_virt_ch):
+            half = mu_ao.astype(np.float32) @ C_virt_ch
+            if compute_device in ["cuda", "mps"]:
+                import torch
+                dev = torch.device(compute_device)
+                return (torch.tensor(C_occ_ch, device=dev).T @ torch.tensor(half, device=dev)).cpu().numpy().astype(np.float64)
+            return (C_occ_ch.T @ half).astype(np.float64)
+
+        mu_ia_x_a = transform_dipole_chan(mu_ao_x, C_occ_a, C_virt_a)
+        mu_ia_y_a = transform_dipole_chan(mu_ao_y, C_occ_a, C_virt_a)
+        mu_ia_z_a = transform_dipole_chan(mu_ao_z, C_occ_a, C_virt_a)
+        mu_ia_x_b = transform_dipole_chan(mu_ao_x, C_occ_b, C_virt_b)
+        mu_ia_y_b = transform_dipole_chan(mu_ao_y, C_occ_b, C_virt_b)
+        mu_ia_z_b = transform_dipole_chan(mu_ao_z, C_occ_b, C_virt_b)
+
+        # Pass as tuples: (alpha_block, beta_block)
+        mu_ia_x = (mu_ia_x_a, mu_ia_x_b)
+        mu_ia_y = (mu_ia_y_a, mu_ia_y_b)
+        mu_ia_z = (mu_ia_z_a, mu_ia_z_b)
+
+        # Sizes for the beta active space (may differ if bse_n_occ/bse_n_virt are clamped differently)
+        bse_n_occ_beta = min(bse_n_occ, homo_index_beta + 1)
+        bse_n_virt_beta = min(bse_n_virt, len(eps_beta) - (homo_index_beta + 1))
+    else:
+        # Singlet or spin-flip triplet: standard single-channel dipoles
+        C_occ = C[:, homo_index - bse_n_occ + 1 : homo_index + 1].astype(np.float32)
+        if C_beta is not None:
+            C_virt = C_beta[:, homo_index_beta + 1 : homo_index_beta + 1 + bse_n_virt].astype(np.float32)
+        else:
+            C_virt = C[:, homo_index + 1 : homo_index + 1 + bse_n_virt].astype(np.float32)
+
+        def transform_dipole(mu_ao):
+            half_transformed = mu_ao.astype(np.float32) @ C_virt 
+            if compute_device in ["cuda", "mps"]:
+                import torch
+                dev = torch.device(compute_device)
+                return (torch.tensor(C_occ, device=dev).T @ torch.tensor(half_transformed, device=dev)).cpu().numpy().astype(np.float64)
+            return (C_occ.T @ half_transformed).astype(np.float64)
+
+        mu_ia_x, mu_ia_y, mu_ia_z = transform_dipole(mu_ao_x), transform_dipole(mu_ao_y), transform_dipole(mu_ao_z)
+        bse_n_occ_beta  = bse_n_occ
+        bse_n_virt_beta = bse_n_virt
+
     del mu_ao_x, mu_ao_y, mu_ao_z; gc.collect()
 
     # Store this for the analysis printouts later
@@ -792,7 +1110,11 @@ def main():
         mu_ia_x=mu_ia_x, mu_ia_y=mu_ia_y, mu_ia_z=mu_ia_z, eps_out=args.eps_out,
         soc_U=None, soc_E=None, device=compute_device,
         vxc_ao_path=args.vxc_ao,
-        nthreads=args.nthreads
+        nthreads=args.nthreads,
+        spin=spin_mode,
+        C_beta=C_beta, eps_beta=eps_beta_shifted, homo_index_beta=homo_index_beta,
+        charge_type=args.charge_type,
+        n_occ_beta=bse_n_occ_beta, n_virt_beta=bse_n_virt_beta
     )
 
     if args.estimate_qp:
@@ -826,7 +1148,11 @@ def main():
             mu_ia_x=mu_ia_x, mu_ia_y=mu_ia_y, mu_ia_z=mu_ia_z, eps_out=args.eps_out,
             soc_U=bse_soc_U, soc_E=bse_soc_E, device=compute_device, 
             vxc_ao_path=args.vxc_ao,
-            nthreads=args.nthreads
+            nthreads=args.nthreads,
+            spin=spin_mode,
+            C_beta=C_beta, eps_beta=eps_beta_shifted, homo_index_beta=homo_index_beta,
+            charge_type=args.charge_type,
+            n_occ_beta=bse_n_occ_beta, n_virt_beta=bse_n_virt_beta
         )
  
         run_solver_and_analysis(solver_soc, np.array(coords_ang), syms, shells, mu_ia_x, mu_ia_y, mu_ia_z, 

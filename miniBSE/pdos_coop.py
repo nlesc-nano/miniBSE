@@ -3,6 +3,8 @@ import csv
 import time
 from miniBSE.io_utils import count_ao_from_shells
 
+PDOS_PALETTE = ["#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A", "#19D3F3", "#FF6692"]
+
 def _ao_metadata(shells):
     ao_to_sym = []
     ao_to_coord = []
@@ -93,6 +95,84 @@ def export_pdos_coop_data(analysis, eps_eV, pdos_atoms, coop_pairs, ewin, sigma=
             for i, en in enumerate(E_sticks):
                 idx = np.where(mask)[0][i]
                 w.writerow([en] + [coop_results[p][idx] for p in coop_results.keys()])
+
+    export_population_bar_plot(analysis, eps_eV, pdos_atoms, ewin, prefix=prefix)
+
+
+def export_population_bar_plot(analysis, eps_eV, pdos_atoms, ewin, prefix="sf"):
+    """Export a non-broadened stacked horizontal population bar plot."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"  [PDOS/COOP] Warning: matplotlib unavailable; skipping population bar plot ({exc}).")
+        return
+
+    P_weights = analysis["P_weights"]
+    ao_to_sym = analysis["ao_to_sym"]
+    mask = (eps_eV >= ewin[0]) & (eps_eV <= ewin[1])
+    idx = np.where(mask)[0]
+    if idx.size == 0:
+        return
+
+    labels, weights = [], []
+    for sym in pdos_atoms:
+        ao_idx = np.where(ao_to_sym == sym)[0]
+        if ao_idx.size == 0:
+            continue
+        labels.append(sym)
+        weights.append(np.sum(P_weights[ao_idx[:, None], idx], axis=0))
+
+    if not weights:
+        return
+
+    W = np.vstack(weights).T
+    W = np.clip(np.real(W), 0.0, None)
+    total = np.sum(W, axis=1)
+    total[total <= 1e-14] = 1.0
+    frac = W / total[:, None]
+    energies = eps_eV[idx]
+
+    order = np.argsort(energies)
+    energies = energies[order]
+    frac = frac[order, :]
+
+    if len(energies) > 1:
+        span = max(float(ewin[1] - ewin[0]), 1e-6)
+        height = min(0.035, max(0.003, 0.75 * span / len(energies)))
+    else:
+        height = 0.035
+
+    fig_h = max(5.0, min(16.0, 0.018 * len(energies) + 4.0))
+    fig, ax = plt.subplots(figsize=(4.2, fig_h))
+    left = np.zeros(len(energies))
+    for j, lab in enumerate(labels):
+        ax.barh(
+            energies, frac[:, j], left=left, height=height,
+            color=PDOS_PALETTE[j % len(PDOS_PALETTE)], edgecolor="none", label=lab
+        )
+        left += frac[:, j]
+
+    ax.axhline(0.0, color="black", linewidth=0.8, linestyle="--", alpha=0.6)
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(float(ewin[0]), float(ewin[1]))
+    ax.set_xlabel("Population fraction")
+    ax.set_ylabel("Energy (eV)")
+    ax.legend(frameon=False, loc="upper center", bbox_to_anchor=(0.5, 1.04), ncol=max(1, min(len(labels), 4)))
+    ax.tick_params(direction="out", width=1.0)
+    for spine in ax.spines.values():
+        spine.set_linewidth(1.0)
+    fig.tight_layout()
+    fig.savefig(f"population_bars_{prefix}.png", dpi=400, bbox_inches="tight")
+    fig.savefig(f"population_bars_{prefix}.svg", bbox_inches="tight")
+    plt.close(fig)
+
+    with open(f"population_bars_{prefix}.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["MO_Energy_eV"] + labels)
+        for en, row in zip(energies, frac):
+            w.writerow([en] + list(row))
 
 
 def compute_pdos_and_coop(C, S, eps_eV, shells, pdos_atoms, coop_pairs, ewin, sigma=0.03, is_soc=False, prefix="sf", pops=None):

@@ -29,6 +29,89 @@ def compute_spin_character(vec, soc_U, n_occ_sp, n_virt_sp, valid_mask=None):
     
     return singlet_weight * 100, triplet_weight * 100
 
+
+def spin_label_from_S(S):
+    labels = {
+        0: "S",
+        1: "T",
+        2: "Q",
+        3: "7",
+        4: "9",
+    }
+    S_int = int(round(S))
+    return labels.get(S_int, f"{2 * S_int + 1}")
+
+
+def infer_reference_spin(n_alpha, n_beta):
+    return abs(float(n_alpha) - float(n_beta)) / 2.0
+
+
+def compute_uks_soc_spin_character(vec, ham, soc_U, n_alpha_ref, n_beta_ref):
+    """
+    Approximate UKS-SOC spin-sector character.
+
+    For a closed-shell reference this reduces to the usual singlet/triplet
+    alpha/beta transition decomposition. For high-spin UKS references, the
+    scalar excitation component is assigned to S_ref and the spin-vector
+    component is distributed over S_ref-1, S_ref, S_ref+1 by product-space
+    dimensions. This is a labeling diagnostic, not an exact <S^2> projection.
+    """
+    if not hasattr(ham, "n_occ_act_b"):
+        s_pct, t_pct = compute_spin_character(vec, soc_U, ham.n_occ_spinor, ham.n_virt_spinor)
+        return {"S": s_pct, "T": t_pct}, 0.0
+
+    X_spinor = np.zeros(ham.dim_spinor_full, dtype=complex)
+    if hasattr(ham, "valid_spinor_idx"):
+        X_spinor[ham.valid_spinor_idx] = vec
+    else:
+        X_spinor[:len(vec)] = vec
+    X_spinor = X_spinor.reshape(ham.n_occ_spinor, ham.n_virt_spinor)
+
+    n_alpha = ham.n_occ_act + ham.n_virt_act
+    occ_cols = slice(0, ham.n_occ_spinor)
+    virt_cols = slice(ham.n_occ_spinor, ham.n_occ_spinor + ham.n_virt_spinor)
+    U_occ_a = soc_U[0:ham.n_occ_act, occ_cols]
+    U_virt_a = soc_U[ham.n_occ_act:n_alpha, virt_cols]
+    U_occ_b = soc_U[n_alpha:n_alpha + ham.n_occ_act_b, occ_cols]
+    U_virt_b = soc_U[n_alpha + ham.n_occ_act_b:n_alpha + ham.n_occ_act_b + ham.n_virt_act_b, virt_cols]
+
+    X_a = U_occ_a.conj() @ X_spinor @ U_virt_a.T
+    X_b = U_occ_b.conj() @ X_spinor @ U_virt_b.T
+
+    n_i = min(X_a.shape[0], X_b.shape[0])
+    n_a = min(X_a.shape[1], X_b.shape[1])
+    paired_a = X_a[:n_i, :n_a]
+    paired_b = X_b[:n_i, :n_a]
+
+    scalar = np.sum(np.abs((paired_a + paired_b) / np.sqrt(2.0)) ** 2)
+    vector = np.sum(np.abs((paired_a - paired_b) / np.sqrt(2.0)) ** 2)
+    vector += np.sum(np.abs(X_a[n_i:, :]) ** 2) + np.sum(np.abs(X_b[n_i:, :]) ** 2)
+    vector += np.sum(np.abs(X_a[:n_i, n_a:]) ** 2) + np.sum(np.abs(X_b[:n_i, n_a:]) ** 2)
+
+    S_ref = infer_reference_spin(n_alpha_ref, n_beta_ref)
+    sectors = {}
+    if S_ref < 1e-8:
+        sectors["S"] = scalar
+        sectors["T"] = vector
+    else:
+        sectors[spin_label_from_S(S_ref)] = sectors.get(spin_label_from_S(S_ref), 0.0) + scalar
+        allowed = [S for S in (S_ref - 1.0, S_ref, S_ref + 1.0) if S >= 0.0]
+        dim_sum = sum(2.0 * S + 1.0 for S in allowed)
+        for S in allowed:
+            label = spin_label_from_S(S)
+            sectors[label] = sectors.get(label, 0.0) + vector * ((2.0 * S + 1.0) / dim_sum)
+
+    total = sum(sectors.values())
+    if total <= 1e-14:
+        return {k: 0.0 for k in sectors}, S_ref
+    return {k: 100.0 * v / total for k, v in sectors.items()}, S_ref
+
+
+def format_spin_character(sectors):
+    order = ["S", "T", "Q", "7", "9"]
+    keys = [k for k in order if k in sectors] + [k for k in sectors if k not in order]
+    return " / ".join(f"{sectors[k]:4.1f}% {k}" for k in keys)
+
 def print_orbital_summary(energies_eV, occ, homo_idx, pops, syms, shells, is_soc=False, offset=0, print_range=15):
     """
     Fast Mulliken population analysis broken down by Element and Angular Momentum (s, p, d).
@@ -81,4 +164,3 @@ def print_orbital_summary(energies_eV, occ, homo_idx, pops, syms, shells, is_soc
         if idx == homo_idx + 1:
             print(f"   {'-- FERMI --':>11} | {'------':>6} | {'------------':>12} | {'-----':>5} | {'-'*45}")
     print("=" * 115 + "\n")
-

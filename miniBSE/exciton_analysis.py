@@ -15,37 +15,74 @@ class ExcitonAnalyzer:
         print(f"  [Analyzer] Initializing Exciton Analyzer...")
         t0 = time.time()
         
-        # --- BULLETPROOF ACTIVE SPACE MAPPING ---
-        self.C_occ = self.solver.ham.C_orig_occ
-        self.C_virt = self.solver.ham.C_orig_virt
-        self.n_occ_act = self.C_occ.shape[1]
+        ham = solver.ham
+        self.is_uks_sp = getattr(ham, 'spin', 'singlet') == 'uks_spin_preserving'
+
+        if self.is_uks_sp:
+            # --- UKS SPIN-PRESERVING: concat alpha + beta channels ---
+            # We build unified C_occ/C_virt by concatenating alpha and beta MOs.
+            # The combined valid_i / valid_a span [0 .. dim_a + dim_b - 1] where
+            #   alpha part: [0 .. n_occ_a-1] occ, [0 .. n_virt_a-1] virt
+            #   beta  part: [n_occ_a .. n_occ_a+n_occ_b-1] occ, [n_virt_a .. n_virt_a+n_virt_b-1] virt
+            # Columns from both channels are concatenated so the index mapping works uniformly.
+            C_occ_a  = ham.C_orig_occ       # alpha occ  [n_ao, n_occ_a]
+            C_virt_a = ham.C_orig_virt      # alpha virt [n_ao, n_virt_a]
+            # Retrieve stored beta MO slices — they are set during init_uks_spin_preserving
+            occ_idx_b  = ham.occ_idx_b
+            virt_idx_b = ham.virt_idx_b
+            # C_beta was stored as dense in the ham? No — we need to get it from solver
+            # solver stores C_beta (raw) — slice to active space
+            C_beta_raw = solver.C_beta
+            if hasattr(C_beta_raw, 'toarray'): C_beta_raw = C_beta_raw.toarray()
+            C_occ_b  = C_beta_raw[:, occ_idx_b]
+            C_virt_b = C_beta_raw[:, virt_idx_b]
+
+            # Concatenate: [alpha cols | beta cols]
+            self.C_occ  = np.concatenate([C_occ_a,  C_occ_b],  axis=1)
+            self.C_virt = np.concatenate([C_virt_a, C_virt_b], axis=1)
+            n_occ_a, n_virt_a = C_occ_a.shape[1], C_virt_a.shape[1]
+            n_occ_b, n_virt_b = C_occ_b.shape[1], C_virt_b.shape[1]
+
+            # Build combined valid_i / valid_a index arrays
+            # Alpha: i in [0..n_occ_a-1], a in [0..n_virt_a-1]
+            # Beta:  i in [n_occ_a..n_occ_a+n_occ_b-1], a in [n_virt_a..n_virt_a+n_virt_b-1]
+            combined_vi = np.concatenate([ham.vi_a, ham.vi_b + n_occ_a])
+            combined_va = np.concatenate([ham.va_a, ham.va_b + n_virt_a])
+            self._combined_vi = combined_vi
+            self._combined_va = combined_va
+        else:
+            # --- Standard singlet / triplet mode ---
+            self.C_occ  = ham.C_orig_occ
+            self.C_virt = ham.C_orig_virt
+
+        self.n_occ_act  = self.C_occ.shape[1]
         self.n_virt_act = self.C_virt.shape[1]
         
         print(f"  [Analyzer] Extracted active space: {self.n_occ_act} occupied, {self.n_virt_act} virtual orbitals.")
 
-        self.SC_occ = self.solver.overlap @ self.C_occ
+        self.SC_occ  = self.solver.overlap @ self.C_occ
         self.SC_virt = self.solver.overlap @ self.C_virt
 
         # --- PRE-COMPUTE MO SPATIAL CENTERS ---
         print(f"  [Analyzer] Precomputing spatial centers for orbitals...")
-        pop_occ_ao = self.C_occ * self.SC_occ
+        pop_occ_ao  = self.C_occ  * self.SC_occ
         pop_virt_ao = self.C_virt * self.SC_virt
         
-        q_occ = np.zeros((self.n_atoms, self.n_occ_act))
+        q_occ  = np.zeros((self.n_atoms, self.n_occ_act))
         q_virt = np.zeros((self.n_atoms, self.n_virt_act))
         
         for i_atom in range(self.n_atoms):
             start, end = self.solver.atom_ao_ranges[i_atom]
-            q_occ[i_atom, :] = np.sum(pop_occ_ao[start:end, :], axis=0)
+            q_occ[i_atom, :]  = np.sum(pop_occ_ao[start:end, :],  axis=0)
             q_virt[i_atom, :] = np.sum(pop_virt_ao[start:end, :], axis=0)
             
         # STRICT NORMALIZATION: Fixes the Covariance scaling bug
-        q_occ /= (np.sum(q_occ, axis=0, keepdims=True) + 1e-12)
+        q_occ  /= (np.sum(q_occ,  axis=0, keepdims=True) + 1e-12)
         q_virt /= (np.sum(q_virt, axis=0, keepdims=True) + 1e-12)
         
         # Calculate strict center of mass for each MO
-        self.r_occ = q_occ.T @ self.coords  # Shape: (n_occ_act, 3)
-        self.r_virt = q_virt.T @ self.coords # Shape: (n_virt_act, 3)
+        self.r_occ  = q_occ.T  @ self.coords  # Shape: (n_occ_act, 3)
+        self.r_virt = q_virt.T @ self.coords  # Shape: (n_virt_act, 3)
         
         print(f"  [Analyzer] Initialization completed in {time.time()-t0:.2f}s.")
 
@@ -55,13 +92,21 @@ class ExcitonAnalyzer:
         hole_weights_mo = np.zeros(self.n_occ_act)
         elec_weights_mo = np.zeros(self.n_virt_act)
 
+        if self.is_uks_sp:
+            # Use the concatenated combined index arrays
+            vi = self._combined_vi
+            va = self._combined_va
+        else:
+            vi = self.solver.ham.valid_i
+            va = self.solver.ham.valid_a
+
         for idx, w in enumerate(weights):
-            i_rel = self.solver.ham.valid_i[idx]
-            a_rel = self.solver.ham.valid_a[idx]
+            i_rel = vi[idx]
+            a_rel = va[idx]
             hole_weights_mo[i_rel] += w
             elec_weights_mo[a_rel] += w
 
-        pop_hole_ao = np.sum((self.C_occ * hole_weights_mo) * self.SC_occ, axis=1)
+        pop_hole_ao = np.sum((self.C_occ  * hole_weights_mo) * self.SC_occ,  axis=1)
         pop_elec_ao = np.sum((self.C_virt * elec_weights_mo) * self.SC_virt, axis=1)
 
         pop_h_atom = np.zeros(self.n_atoms)
@@ -95,8 +140,8 @@ class ExcitonAnalyzer:
         results['sigma_h'] = np.sqrt(var_h)
         results['sigma_e'] = np.sqrt(var_e)
 
-        vi = self.solver.ham.valid_i
-        va = self.solver.ham.valid_a
+        vi = self._combined_vi if self.is_uks_sp else self.solver.ham.valid_i
+        va = self._combined_va if self.is_uks_sp else self.solver.ham.valid_a
         
         r_h_active = self.r_occ[vi] 
         r_e_active = self.r_virt[va] 
@@ -115,11 +160,11 @@ class ExcitonAnalyzer:
         return results
 
 # ================= PLOTTING FUNCTIONS =================
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import numpy as np
 
 def plot_analysis_summary(analysis_results, physics_metrics=None, filename=None, show=False, broadening="gaussian", sigma=0.1):
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
     energies = [res['energy'] for res in analysis_results]
     f_osc = [res['f_osc'] for res in analysis_results]
     d_eh = [res['d_eh'] for res in analysis_results]

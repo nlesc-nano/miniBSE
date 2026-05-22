@@ -11,12 +11,16 @@ def load_fuzzy(npz_path):
     d = np.load(npz_path, allow_pickle=True)
     Z = np.asarray(d["intensity"], dtype=float)
     centres = np.asarray(d["centres"], dtype=float)
+    spinpol = np.asarray(d["spinpol"], dtype=float) if "spinpol" in d else None
     step = int(np.ceil((Z.size / 250_000) ** 0.5))
     if step > 1:
         Z = Z[::step, ::step]
         centres = centres[::step]
+        if spinpol is not None:
+            spinpol = spinpol[::step, ::step]
     return dict(
         centres=centres, Z=Z, 
+        spinpol=spinpol,
         tick_positions=np.asarray(d.get("tick_positions", []), dtype=float), 
         tick_labels=[str(x) for x in d.get("tick_labels", [])],
         extent=np.asarray(d.get("extent", [0.0, float(Z.shape[1]-1), float(centres.min()), float(centres.max())]), dtype=float),
@@ -148,7 +152,12 @@ def parse_cube(filepath):
     return X.flatten(), Y.flatten(), Z.flatten(), V.flatten(), atoms_ang
 
 def generate_interactive_plot(prefix="sf", material="DEFAULT", ef=0.0, e_homo=None, e_lumo=None, normalize_coop=False, energy_label="Energy (eV)", output_html=None, fuzzy_display_mode="raw"):
-    lbl = "SOC" if prefix == "soc" else "Spin-Free"
+    if prefix.startswith("soc"):
+        lbl = "SOC"
+    elif prefix.startswith("uks"):
+        lbl = "UKS"
+    else:
+        lbl = "Spin-Free"
     print(f"  [Plotter] Generating elegant {lbl} HTML dashboard ({energy_label})...")
     
     # =========================================================================
@@ -196,6 +205,25 @@ def generate_interactive_plot(prefix="sf", material="DEFAULT", ef=0.0, e_homo=No
     )
 
     fig.add_trace(heat, row=1, col=1)
+
+    if fuzzy.get("spinpol") is not None:
+        spinpol = fuzzy["spinpol"].astype(float, copy=True)
+        spinpol[Z <= max(vmin_base, 1e-12)] = np.nan
+        fig.add_trace(
+            go.Heatmap(
+                z=spinpol, x=kx, y=fuzzy["centres"],
+                colorscale="RdBu", zmin=-1.0, zmax=1.0,
+                opacity=0.38, showscale=True, zsmooth="best",
+                colorbar=dict(
+                    title=dict(text="<b>α-β</b>", font=dict(size=20)),
+                    orientation="h", len=0.18, thickness=16,
+                    x=0.38, xanchor="center", y=1.08, yanchor="bottom",
+                    tickfont=dict(size=16)
+                ),
+                hovertemplate="k=%{x:.3f} Å⁻¹<br>E=%{y:.3f} eV<br>spin pol=%{z:.2f}<extra></extra>"
+            ),
+            row=1, col=1
+        )
    
     if fuzzy["tick_positions"].size:
         # FIX: Scale ticks based on the original physical width, not the downsampled pixel count
@@ -246,15 +274,19 @@ def generate_interactive_plot(prefix="sf", material="DEFAULT", ef=0.0, e_homo=No
                 xs.extend([0.0, float(xv), None]); ys.extend([float(yi), float(yi), None])
             fig.add_trace(go.Scattergl(x=xs, y=ys, mode="lines", line=dict(color=palette[i % len(palette)], width=4), name=p, legend="legend3"), row=1, col=5)
 
+    gap_mid = 0.5 * (e_homo + e_lumo) if e_homo is not None and e_lumo is not None else None
+    reference_y = ef if ef is not None else gap_mid
+
     for col in range(1, 6):
-        line_col_ef = "white" if col == 1 else "rgba(0,0,0,0.4)"
-        fig.add_hline(y=ef, line_dash="dash", line_color=line_col_ef, line_width=2.5, row=1, col=col, layer="above")
+        line_col_ref = "white" if col == 1 else "rgba(0,0,0,0.4)"
+        if reference_y is not None:
+            fig.add_hline(y=reference_y, line_dash="dash", line_color=line_col_ref, line_width=2.5, row=1, col=col, layer="above")
         if e_homo is not None: fig.add_hline(y=e_homo, line_dash="dot", line_color="royalblue", line_width=3, row=1, col=col, layer="above")
         if e_lumo is not None: fig.add_hline(y=e_lumo, line_dash="dot", line_color="crimson", line_width=3, row=1, col=col, layer="above")
 
     if e_homo is not None and e_lumo is not None:
         gap = e_lumo - e_homo
-        fig.add_annotation(x=0.03, y=ef, xref="x domain", yref="y", text=f"<b>E<sub>g</sub> = {gap:.3f} eV</b>", showarrow=False, font=dict(color="white", size=24), xanchor="left", yanchor="bottom", yshift=8)
+        fig.add_annotation(x=0.03, y=reference_y, xref="x domain", yref="y", text=f"<b>E<sub>g</sub> = {gap:.3f} eV</b>", showarrow=False, font=dict(color="white", size=24), xanchor="left", yanchor="bottom", yshift=8)
         fig.add_annotation(x=0.97, y=e_homo, xref="x domain", yref="y", text="<b>HOMO</b>", showarrow=False, font=dict(color="royalblue", size=22), xanchor="right", yanchor="bottom", yshift=6)
         fig.add_annotation(x=0.97, y=e_lumo, xref="x domain", yref="y", text="<b>LUMO</b>", showarrow=False, font=dict(color="crimson", size=22), xanchor="right", yanchor="top", yshift=-6)
 

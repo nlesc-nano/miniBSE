@@ -17,6 +17,7 @@ find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 find_package(pybind11 REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(Libint2 REQUIRED)
+find_package(OpenMP)
 
 # --------------------------------------------------
 # Build module
@@ -37,6 +38,10 @@ target_link_libraries(libint_cpp PRIVATE
     Libint2::cxx
     Eigen3::Eigen
 )
+
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(libint_cpp PRIVATE OpenMP::OpenMP_CXX)
+endif()
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
@@ -63,4 +68,3 @@ else()
         LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
     )
 endif()
-

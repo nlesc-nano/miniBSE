@@ -27,7 +27,9 @@ class ExcitonSolver:
                  include_exchange=False, estimate_qp=False, e_thresh=None, f_thresh=0.0, 
                  mu_ia_x=None, mu_ia_y=None, mu_ia_z=None, eps_out=2.0, 
                  soc_U=None, soc_E=None, device="numpy", precomputed_sigma=None, 
-                 vxc_ao_path=None, nthreads=1):
+                 vxc_ao_path=None, nthreads=1, spin='singlet', 
+                 C_beta=None, eps_beta=None, homo_index_beta=None, charge_type='mulliken',
+                 n_occ_beta=None, n_virt_beta=None):
 
         self.C = C
         self.overlap = overlap
@@ -36,6 +38,10 @@ class ExcitonSolver:
         self.n_virt = n_virt
         self.homo_index = homo_index
         self.soc_flag = (soc_U is not None and soc_E is not None)
+        self.spin = spin
+        self.C_beta = C_beta
+        self.eps_beta = eps_beta
+        self.homo_index_beta = homo_index_beta
 
         # --- UPDATED KERNEL LOGIC in solver.py ---
         if kernel.lower() == "resta":
@@ -71,7 +77,10 @@ class ExcitonSolver:
             include_exchange=include_exchange, estimate_qp=estimate_qp, e_thresh=e_thresh, 
             f_thresh=f_thresh, mu_ia_x=mu_ia_x, mu_ia_y=mu_ia_y, mu_ia_z=mu_ia_z, 
             soc_U=soc_U, soc_E=soc_E, device=device, precomputed_sigma=precomputed_sigma,
-            vxc_ao_path=vxc_ao_path, nthreads=nthreads
+            vxc_ao_path=vxc_ao_path, nthreads=nthreads, spin=spin,
+            C_beta=C_beta, eps_beta=eps_beta, homo_index_beta=homo_index_beta,
+            charge_type=charge_type,
+            n_occ_beta=n_occ_beta, n_virt_beta=n_virt_beta
         )
 
     def solve(self, nroots=10, full_diag=False, tol=1e-5):
@@ -84,18 +93,87 @@ class ExcitonSolver:
             
             if not self.soc_flag:
                 # ==========================================================
-                # SPATIAL DENSE BUILDER (Spin-Free Singlets)
+                # SPATIAL DENSE BUILDER (Spin-Free Singlets or Triplets)
                 # ==========================================================
-                print("  [Dense] Building Coulomb term (2J)...")
-                t0 = time.time()
-                temp = self.ham.q_flat @ self.ham.gamma
-                J_mat = temp @ self.ham.q_flat.T
-                H = np.diag(self.ham.D) + 2.0 * J_mat
-                self.J_mat = 2.0 * J_mat
-                self.K_mat = np.zeros_like(J_mat)
-                print(f"    -> Coulomb built in {time.time()-t0:.2f}s")
+                is_triplet = getattr(self.ham, 'spin', 'singlet') == 'triplet'
+                is_uks_sp  = getattr(self.ham, 'spin', 'singlet') == 'uks_spin_preserving'
+
+                if is_triplet:
+                    print("  [Dense] Building Triplet Hamiltonian (No Coulomb J)...")
+                    H = np.diag(self.ham.D).copy()
+                    self.J_mat = np.zeros((self.ham.dim, self.ham.dim))
+                    self.K_mat = np.zeros_like(self.J_mat)
+                    if self.ham.include_exchange:
+                        print("  [Dense] Building Triplet Exchange matrix (-K)...")
+                        t1 = time.time()
+                        vi, va = self.ham.valid_i, self.ham.valid_a
+                        n_p = len(vi)
+                        q_occ_sub  = self.ham.q_occ[vi[:, None], vi[None, :], :]
+                        q_virt_sub = self.ham.q_virt[va[:, None], va[None, :], :]
+                        W_sub = (q_virt_sub.reshape(n_p * n_p, -1) @ self.ham.gamma).reshape(n_p, n_p, -1)
+                        K_truncated = np.sum(q_occ_sub * W_sub, axis=-1)
+                        H -= K_truncated
+                        self.K_mat = K_truncated
+                        print(f"    -> Triplet K built in {time.time()-t1:.2f}s")
+
+                elif is_uks_sp:
+                    # ----------------------------------------------------------
+                    # UKS SPIN-PRESERVING (Manifold B) DENSE BUILDER
+                    # ----------------------------------------------------------
+                    print("  [Dense] Building UKS Spin-Preserving Hamiltonian (Manifold B)...")
+                    t0 = time.time()
+
+                    # Coulomb J: couples all transitions (alpha and beta) with factor 1.0
+                    # q_flat is [dim_a + dim_b, n_atoms] — the unified charge array
+                    temp = self.ham.q_flat @ self.ham.gamma
+                    J_mat = temp @ self.ham.q_flat.T
+                    H = np.diag(self.ham.D) + 1.0 * J_mat
+                    self.J_mat = 1.0 * J_mat
+                    self.K_mat = np.zeros_like(J_mat)
+                    print(f"    -> Coulomb built in {time.time()-t0:.2f}s")
+
+                    if self.ham.include_exchange:
+                        print("  [Dense] Building block-diagonal Exchange matrix (-K_alpha, -K_beta)...")
+                        t1 = time.time()
+                        dim_a = self.ham.dim_a
+                        dim_b = self.ham.dim_b
+                        vi_a, va_a = self.ham.vi_a, self.ham.va_a
+                        vi_b, va_b = self.ham.vi_b, self.ham.va_b
+                        n_a = len(vi_a)
+                        n_b = len(vi_b)
+
+                        # Alpha block K_alpha
+                        K_full = np.zeros((self.ham.dim, self.ham.dim))
+                        if n_a > 0:
+                            q_occ_sub_a  = self.ham.q_occ_a[vi_a[:, None], vi_a[None, :], :]
+                            q_virt_sub_a = self.ham.q_virt_a[va_a[:, None], va_a[None, :], :]
+                            W_sub_a = (q_virt_sub_a.reshape(n_a * n_a, -1) @ self.ham.gamma).reshape(n_a, n_a, -1)
+                            K_alpha = np.sum(q_occ_sub_a * W_sub_a, axis=-1)
+                            K_full[:dim_a, :dim_a] = K_alpha
+
+                        # Beta block K_beta
+                        if n_b > 0:
+                            q_occ_sub_b  = self.ham.q_occ_b[vi_b[:, None], vi_b[None, :], :]
+                            q_virt_sub_b = self.ham.q_virt_b[va_b[:, None], va_b[None, :], :]
+                            W_sub_b = (q_virt_sub_b.reshape(n_b * n_b, -1) @ self.ham.gamma).reshape(n_b, n_b, -1)
+                            K_beta = np.sum(q_occ_sub_b * W_sub_b, axis=-1)
+                            K_full[dim_a:, dim_a:] = K_beta
+
+                        H -= K_full
+                        self.K_mat = K_full
+                        print(f"    -> Exchange built in {time.time()-t1:.2f}s")
+
+                else:
+                    print("  [Dense] Building Coulomb term (2J)...")
+                    t0 = time.time()
+                    temp = self.ham.q_flat @ self.ham.gamma
+                    J_mat = temp @ self.ham.q_flat.T
+                    H = np.diag(self.ham.D) + 2.0 * J_mat
+                    self.J_mat = 2.0 * J_mat
+                    self.K_mat = np.zeros_like(J_mat)
+                    print(f"    -> Coulomb built in {time.time()-t0:.2f}s")
                 
-                if self.ham.include_exchange:
+                if self.ham.include_exchange and not is_uks_sp and not is_triplet:
                     print("  [Dense] Building Exchange matrix (-K)...")
                     t1 = time.time()
                     c_x = getattr(self.ham, 'c_x', 1.0) 
@@ -194,6 +272,16 @@ class ExcitonSolver:
     def main_transition(self, vec):
         """Extracts the dominant hole and electron indices from a state vector."""
         idx = np.argmax(np.abs(vec))
+        if getattr(self.ham, 'spin', 'singlet') == 'uks_spin_preserving' and not self.soc_flag:
+            # Identify which spin channel the dominant contribution belongs to
+            if idx < self.ham.dim_a:
+                hole = self.ham.vi_a[idx]
+                elec = self.ham.va_a[idx]
+            else:
+                idx_b = idx - self.ham.dim_a
+                hole = self.ham.vi_b[idx_b]
+                elec = self.ham.va_b[idx_b]
+            return hole, elec, abs(vec[idx])
         if not self.soc_flag:
             hole = self.ham.valid_i[idx]
             elec = self.ham.valid_a[idx]

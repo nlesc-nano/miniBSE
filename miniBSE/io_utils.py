@@ -8,7 +8,9 @@ from scipy.sparse import issparse, csr_matrix
 import libint_cpp
 
 
-BOHR_PER_ANGSTROM = 1.889726124565062
+from miniBSE.constants import BOHR_PER_ANG
+
+BOHR_PER_ANGSTROM = BOHR_PER_ANG
 
 
 # ============================================================
@@ -114,68 +116,6 @@ def parse_basis(fname, wanted):
 
     return basis
 
-def parse_basis_old(fname, wanted):
-
-    basis = collections.defaultdict(list)
-
-    with open(fname) as f:
-        lines = f.readlines()
-
-    it = iter(lines)
-
-    for line in it:
-        line = line.strip()
-
-        if not line or line.startswith("#"):
-            continue
-
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-
-        elem, bname = parts[0], parts[1]
-
-        if bname != wanted:
-            continue
-
-        nset = int(next(it).split()[0])
-
-        for _ in range(nset):
-
-            hdr = next(it).split()
-
-            lmin = int(hdr[1])
-            nexp = int(hdr[3])
-            counts = list(map(int, hdr[4:]))
-
-            exps = []
-            coef_rows = []
-
-            for _ in range(nexp):
-                row = next(it).split()
-                exps.append(float(row[0]))
-                coef_rows.append([float(c) for c in row[1:]])
-
-            exps = np.array(exps)
-            coef_cols = np.array(coef_rows).T
-
-            idx = 0
-
-            for j, n_shells in enumerate(counts):
-
-                l = lmin + j
-
-                for _ in range(n_shells):
-
-                    coefs = coef_cols[idx].copy()
-                    basis[elem].append(
-                        (l, exps.copy(), coefs)
-                    )
-
-                    idx += 1
-
-    return basis
-
 
 
 # ============================================================
@@ -276,149 +216,17 @@ def read_mos_auto(path, n_ao_total, verbose=False):
 
     return read_mos_txt_cc(path, n_ao_total, verbose=verbose)
 
+def read_mos_uks(path_alpha, path_beta, n_ao, verbose=False):
+    """
+    Reads alpha and beta MO files from a CP2K UKS calculation.
+    Returns:
+        C_alpha, eps_alpha, occ_alpha  — alpha spin channel
+        C_beta,  eps_beta,  occ_beta   — beta spin channel
+    """
+    C_alpha, eps_alpha, occ_alpha = read_mos_auto(path_alpha, n_ao, verbose=verbose)
+    C_beta,  eps_beta,  occ_beta  = read_mos_auto(path_beta,  n_ao, verbose=verbose)
+    return C_alpha, eps_alpha, occ_alpha, C_beta, eps_beta, occ_beta
 
-def read_mos_txt(path, n_ao_total, verbose=False):
-
-    t0 = time.perf_counter()
-
-    blocks = []
-    n_mo_total = 0
-
-    def is_int_line(s):
-        toks = s.split()
-        return toks and all(tok.lstrip("+").isdigit() for tok in toks)
-
-    with open(path) as f:
-        while True:
-            line = f.readline()
-            if not line:
-                break
-
-            s = line.strip()
-            if not is_int_line(s):
-                continue
-
-            n_cols = len(s.split())
-
-            f.readline()
-            f.readline()
-
-            for _ in range(n_ao_total):
-                f.readline()
-
-            blocks.append((n_mo_total, n_cols))
-            n_mo_total += n_cols
-
-    if n_mo_total == 0:
-        raise RuntimeError("No MO blocks detected")
-
-    C = np.zeros((n_ao_total, n_mo_total), dtype=np.float32)
-    eps = np.zeros(n_mo_total)
-    occ = np.zeros(n_mo_total)
-
-    with open(path) as f:
-        blk_idx = 0
-
-        while True:
-            line = f.readline()
-            if not line:
-                break
-
-            s = line.strip()
-            if not is_int_line(s):
-                continue
-
-            offset, n_cols = blocks[blk_idx]
-            blk_idx += 1
-
-            col_slice = slice(offset, offset + n_cols)
-
-            # energies
-            vals = _extract_numbers(f.readline())
-            eps[col_slice] = vals[:n_cols]
-
-            # occupations
-            vals = _extract_numbers(f.readline())
-            occ[col_slice] = vals[:n_cols]
-
-            # coefficients
-            for ao_row in range(n_ao_total):
-                line_str = f.readline()
-                toks = line_str.split()
-                # The actual coefficients are always the last n_cols items on the line
-                coef_toks = toks[-n_cols:]
-                
-                # Convert 'D' to 'E' for scientific notation
-                vals = [float(x.replace("D", "E").replace("d", "E")) for x in coef_toks]
-                C[ao_row, col_slice] = vals
-
-    if verbose:
-        dt = time.perf_counter() - t0
-        print(f"[MOs] Parsed in {dt:.2f} s | C shape {C.shape}")
-
-    return C, eps, occ
-
-def read_mos_txt_fast(path, n_ao_total, verbose=False):
-    t0 = time.perf_counter()
-
-    # 1. Global Replace in C-speed: Read entire file into memory and fix 'D' to 'E'
-    with open(path, 'r') as f:
-        raw_text = f.read().replace('D', 'E').replace('d', 'E')
-
-    # Split into lines once
-    lines = raw_text.splitlines()
-
-    C_blocks = []
-    eps_list = []
-    occ_list = []
-
-    i = 0
-    n_lines = len(lines)
-
-    while i < n_lines:
-        s = lines[i].strip()
-
-        # 2. Fast check for the header line (avoids splitting every single line)
-        if s and s[0].lstrip('+').isdigit():
-            toks = s.split()
-            
-            if all(t.lstrip("+").isdigit() for t in toks):
-                n_cols = len(toks)
-
-                # Energies (Assuming numbers are the last n_cols items on the line)
-                eps_list.extend(float(x) for x in lines[i+1].split()[-n_cols:])
-                
-                # Occupations
-                occ_list.extend(float(x) for x in lines[i+2].split()[-n_cols:])
-
-                # Coefficients block
-                block_lines = lines[i+3 : i+3+n_ao_total]
-                
-                # 3. Fast list comprehension to flatten the block
-                block_vals = [val for row in block_lines for val in row.split()[-n_cols:]]
-                
-                # Convert straight to a localized 2D NumPy array
-                C_blocks.append(np.array(block_vals, dtype=np.float32).reshape(n_ao_total, n_cols))
-
-                # Jump the index completely past this block
-                i += 3 + n_ao_total
-                continue
-
-        i += 1
-
-    if not C_blocks:
-        raise RuntimeError("No MO blocks detected")
-
-    # 4. Horizontally stack all blocks simultaneously 
-    C = np.hstack(C_blocks)
-    eps = np.array(eps_list, dtype=np.float32)
-    occ = np.array(occ_list, dtype=np.float32)
-
-    if verbose:
-        dt = time.perf_counter() - t0
-        print(f"[MOs] Parsed in {dt:.4f} s | C shape {C.shape}")
-
-    return C, eps, occ
 
 def read_mos_txt_cc(path, n_ao_total, verbose=False):
     t0 = time.perf_counter()

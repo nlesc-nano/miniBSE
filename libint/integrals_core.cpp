@@ -268,11 +268,12 @@ inline void build_Tlist_screened(const Eigen::Matrix3d& A,
 Matrix overlap_pbc(const std::vector<libint2::Shell>& shells,
                    const Eigen::Matrix3d& lattice_A, 
                    double cutoff_A, 
-                   int /*nthreads*/) {
+                   int nthreads) {
 
   const size_t nsh = shells.size();
   const auto off = map_shell_to_basis_function(shells);
   const size_t nbf = off.back() + shells.back().size();
+  const int nt = std::max(1, nthreads);
 
   Matrix S = Matrix::Zero(nbf, nbf);
 
@@ -282,8 +283,10 @@ Matrix overlap_pbc(const std::vector<libint2::Shell>& shells,
     for (const auto& c : sh.contr) max_l_v = std::max<int>(max_l_v, c.l);
   }
   
-  libint2::Engine eng(libint2::Operator::overlap, max_nprim_v, max_l_v, 0);
-  eng.set_precision(1e-12);
+  std::vector<libint2::Engine> engines(nt);
+  engines[0] = libint2::Engine(libint2::Operator::overlap, max_nprim_v, max_l_v, 0);
+  engines[0].set_precision(1e-12);
+  for (int i = 1; i < nt; ++i) engines[i] = engines[0];
   
   constexpr double BOHR_PER_ANG = 1.889726124565062;
   const bool use_MIC_only = !(cutoff_A > 0.0);
@@ -294,50 +297,61 @@ Matrix overlap_pbc(const std::vector<libint2::Shell>& shells,
   std::vector<double> ext(nsh, 0.0);
   for (size_t s = 0; s < nsh; ++s) ext[s] = shell_extent_bohr(shells[s], 4.0);
   const Eigen::Matrix3d Linv = lattice_A.inverse();
-  std::vector<Eigen::Vector3d> Tlist; Tlist.reserve(64);
 
-  for (size_t si = 0; si < nsh; ++si) {
-    const auto& shi = shells[si];
-    const size_t fi0 = off[si];
-    const Eigen::Vector3d Ri(shi.O[0], shi.O[1], shi.O[2]);
-    for (size_t sj = si; sj < nsh; ++sj) {
-      const auto& shj = shells[sj];
-      const size_t fj0 = off[sj];
-      const Eigen::Vector3d Rj(shj.O[0], shj.O[1], shj.O[2]);
-      const Eigen::Vector3d dR = Rj - Ri;
-      const Eigen::Vector3d uvw = Linv * dR;
-      const Eigen::Vector3i m_mic = nint3(uvw);
-      const double extent_ij = ext[si] + ext[sj];
-      Tlist.clear();
+  std::vector<std::pair<size_t, size_t>> shell_pairs;
+  shell_pairs.reserve((nsh * (nsh + 1)) / 2);
+  for (size_t si = 0; si < nsh; ++si)
+    for (size_t sj = si; sj < nsh; ++sj)
+      shell_pairs.emplace_back(si, sj);
 
-      if (use_MIC_only) {
-        Tlist.emplace_back(-lattice_A * m_mic.cast<double>());
-      } else {
-        build_Tlist_screened(lattice_A, m_mic, dR, rcut_bohr, extent_ij, Tlist);
-      }
+  parallel_do([&](int tid) {
+    auto& eng = engines[tid];
+    std::vector<Eigen::Vector3d> Tlist;
+    Tlist.reserve(64);
 
-      Matrix Sblock = Matrix::Zero(shi.size(), shj.size());
-      for (const auto& T : Tlist) {
-        libint2::Shell shj_shift = shj;
-        shj_shift.O[0] += T[0];
-        shj_shift.O[1] += T[1];
-        shj_shift.O[2] += T[2];
-        eng.compute(shi, shj_shift);
-        const auto& buf = eng.results();
-        if (!buf.empty() && buf[0] != nullptr) {
-          const double* p = buf[0];
-          for (int fi = 0; fi < (int)shi.size(); ++fi)
-            for (int fj = 0; fj < (int)shj.size(); ++fj)
-              Sblock(fi, fj) += p[fi * (int)shj.size() + fj];
+    for (size_t pair_idx = static_cast<size_t>(tid); pair_idx < shell_pairs.size(); pair_idx += static_cast<size_t>(nt)) {
+        const size_t si = shell_pairs[pair_idx].first;
+        const size_t sj = shell_pairs[pair_idx].second;
+        const auto& shi = shells[si];
+        const auto& shj = shells[sj];
+        const size_t fi0 = off[si];
+        const size_t fj0 = off[sj];
+        const Eigen::Vector3d Ri(shi.O[0], shi.O[1], shi.O[2]);
+        const Eigen::Vector3d Rj(shj.O[0], shj.O[1], shj.O[2]);
+        const Eigen::Vector3d dR = Rj - Ri;
+        const Eigen::Vector3d uvw = Linv * dR;
+        const Eigen::Vector3i m_mic = nint3(uvw);
+        const double extent_ij = ext[si] + ext[sj];
+
+        if (use_MIC_only) {
+          Tlist.clear();
+          Tlist.emplace_back(-lattice_A * m_mic.cast<double>());
+        } else {
+          build_Tlist_screened(lattice_A, m_mic, dR, rcut_bohr, extent_ij, Tlist);
         }
-      }
-      S.block(fi0, fj0, shi.size(), shj.size()) = Sblock;
-      if (sj != si) S.block(fj0, fi0, shj.size(), shi.size()) = Sblock.transpose();
+
+        Matrix Sblock = Matrix::Zero(shi.size(), shj.size());
+        for (const auto& T : Tlist) {
+          libint2::Shell shj_shift = shj;
+          shj_shift.O[0] += T[0];
+          shj_shift.O[1] += T[1];
+          shj_shift.O[2] += T[2];
+          eng.compute(shi, shj_shift);
+          const auto& buf = eng.results();
+          if (!buf.empty() && buf[0] != nullptr) {
+            const double* p = buf[0];
+            for (int fi = 0; fi < (int)shi.size(); ++fi)
+              for (int fj = 0; fj < (int)shj.size(); ++fj)
+                Sblock(fi, fj) += p[fi * (int)shj.size() + fj];
+          }
+        }
+        S.block(fi0, fj0, shi.size(), shj.size()) = Sblock;
+        if (sj != si) S.block(fj0, fi0, shj.size(), shi.size()) = Sblock.transpose();
     }
-  }
+  }, nt);
+
   return S;
 }
 
 } // namespace licpp
-
 
