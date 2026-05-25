@@ -344,7 +344,11 @@ def run_fuzzy_bands_and_pdos(args, C_dense, S_dense, eps_shifted, occ, homo_inde
     pdos_analysis_sf = None
     if getattr(args, 'pdos_atoms', None) and getattr(args, 'coop_pairs', None):
         print("  [PDOS/COOP] Computing Spin-Free population analysis...")
-        pdos_analysis_sf = compute_pdos_and_coop(C_dense, S_dense, eps_shifted, shells, args.pdos_atoms, args.coop_pairs, dft_ewin, sigma=pdos_sigma_use, is_soc=False, prefix="sf", pops=pops_sf)
+        pdos_analysis_sf = compute_pdos_and_coop(
+            C_dense, S_dense, eps_shifted, shells, args.pdos_atoms, args.coop_pairs, dft_ewin,
+            sigma=pdos_sigma_use, is_soc=False, prefix="sf", pops=pops_sf,
+            population_bars=getattr(args, "population_bars", None)
+        )
 
     if dashboard_energy_mode in ("qp", "both"):
         if qp_plot_energies is None:
@@ -355,7 +359,11 @@ def run_fuzzy_bands_and_pdos(args, C_dense, S_dense, eps_shifted, occ, homo_inde
         else:
             smear_and_export_fuzzy(intensity_sf, qp_fuzzy, labels, qp_ewin, sigma_use, prefix="sf_qp")
             if pdos_analysis_sf is not None:
-                export_pdos_coop_data(pdos_analysis_sf, qp_plot_energies, args.pdos_atoms, args.coop_pairs, qp_ewin, sigma=pdos_sigma_use, is_soc=False, prefix="sf_qp")
+                export_pdos_coop_data(
+                    pdos_analysis_sf, qp_plot_energies, args.pdos_atoms, args.coop_pairs, qp_ewin,
+                    sigma=pdos_sigma_use, is_soc=False, prefix="sf_qp",
+                    population_bars=getattr(args, "population_bars", None)
+                )
 
     is_uks = C_beta_dense is not None and eps_beta_shifted is not None and homo_index_beta is not None
     if is_uks:
@@ -578,7 +586,11 @@ def run_fuzzy_bands_and_pdos(args, C_dense, S_dense, eps_shifted, occ, homo_inde
                             np.real(C_spinor_ao[n_ao:, :].conj() * SC_spinor_ao[n_ao:, :])
             print(f"  [PDOS/COOP] Pre-computed populations in {time.time() - t_pop:.2f}s")
             
-            compute_pdos_and_coop(C_spinor_ao, S_dense, eps_soc, shells, args.pdos_atoms, args.coop_pairs, soc_ewin, sigma=pdos_sigma_use, is_soc=True, prefix="soc", pops=pops_soc_full)
+            compute_pdos_and_coop(
+                C_spinor_ao, S_dense, eps_soc, shells, args.pdos_atoms, args.coop_pairs, soc_ewin,
+                sigma=pdos_sigma_use, is_soc=True, prefix="soc", pops=pops_soc_full,
+                population_bars=getattr(args, "population_bars", None)
+            )
 
     # --- 3. Generate Multi-Row Interactive Plotly HTML ---
     if getattr(args, 'plot', True) or getattr(args, 'plot_fuzzy', True):

@@ -4,22 +4,30 @@ import time
 from miniBSE.io_utils import count_ao_from_shells
 
 PDOS_PALETTE = ["#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A", "#19D3F3", "#FF6692"]
+TAG_PALETTE = ["#111111", "#8C564B", "#17BECF", "#D62728", "#2CA02C", "#9467BD", "#FF7F0E"]
 
 def _ao_metadata(shells):
     ao_to_sym = []
+    ao_to_atom = []
     ao_to_coord = []
+    atom_symbols = {}
 
     # Use the robust internal counter so we never misalign AOs
     for sh in shells:
         n_funcs = count_ao_from_shells([sh])
         sym = sh.get("sym", "X")
+        atom_idx = int(sh.get("atom_idx", 0))
         coord = sh.get("O", sh.get("center", [0.0, 0.0, 0.0]))
         for _ in range(n_funcs):
             ao_to_sym.append(sym)
+            ao_to_atom.append(atom_idx)
             ao_to_coord.append(coord)
+        atom_symbols.setdefault(atom_idx, sym)
             
     ao_to_sym = np.array(ao_to_sym)
+    ao_to_atom = np.array(ao_to_atom, dtype=int)
     ao_to_coord = np.array(ao_to_coord)
+    atom_symbols = [atom_symbols[i] for i in sorted(atom_symbols.keys())]
 
     # Surface vs Core Logic (Outer 25% of the radius is considered Surface)
     unique_coords = np.unique(ao_to_coord, axis=0)
@@ -28,13 +36,70 @@ def _ao_metadata(shells):
     R_max = np.max(ao_dists)
     surface_ao_mask = np.ones(len(ao_dists), dtype=bool) if R_max < 1e-3 else (ao_dists >= 0.75 * R_max)
 
-    return ao_to_sym, surface_ao_mask
+    return ao_to_sym, ao_to_atom, atom_symbols, surface_ao_mask
 
 
-def export_pdos_coop_data(analysis, eps_eV, pdos_atoms, coop_pairs, ewin, sigma=0.03, is_soc=False, prefix="sf"):
+def _normalize_population_bar_tags(population_bars, atom_symbols):
+    if not population_bars:
+        return []
+
+    atom_index_base = int(population_bars.get("atom_index_base", 1))
+    tagged_atoms = population_bars.get("tagged_atoms", [])
+    normalized = []
+    used_atoms = set()
+
+    for tag_idx, entry in enumerate(tagged_atoms):
+        if not isinstance(entry, dict):
+            continue
+
+        raw_indices = entry.get("indices", None)
+        if raw_indices is None:
+            raw_indices = [entry.get("index", None)]
+        elif np.isscalar(raw_indices):
+            raw_indices = [raw_indices]
+
+        atom_indices = []
+        for raw in raw_indices:
+            if raw is None:
+                continue
+            atom_idx = int(raw) - atom_index_base
+            if atom_idx < 0 or atom_idx >= len(atom_symbols):
+                print(f"  [PDOS/COOP] Warning: tagged atom index {raw} is out of range; skipping.")
+                continue
+            if atom_idx in used_atoms:
+                print(f"  [PDOS/COOP] Warning: tagged atom index {raw} appears more than once; skipping duplicate.")
+                continue
+            used_atoms.add(atom_idx)
+            atom_indices.append(atom_idx)
+
+        if not atom_indices:
+            continue
+
+        label = entry.get("label")
+        if not label:
+            if len(atom_indices) == 1:
+                atom0 = atom_indices[0]
+                label = f"{atom_symbols[atom0]}[{atom0 + atom_index_base}]"
+            else:
+                idx_str = ",".join(str(i + atom_index_base) for i in atom_indices)
+                label = f"tag[{idx_str}]"
+
+        color = entry.get("color", TAG_PALETTE[tag_idx % len(TAG_PALETTE)])
+        normalized.append({
+            "label": label,
+            "color": color,
+            "atom_indices": atom_indices,
+        })
+
+    return normalized
+
+
+def export_pdos_coop_data(analysis, eps_eV, pdos_atoms, coop_pairs, ewin, sigma=0.03, is_soc=False, prefix="sf", population_bars=None):
     """Export PDOS/COOP/IPR using precomputed weights and a supplied energy axis."""
     P_weights = analysis["P_weights"]
     ao_to_sym = analysis["ao_to_sym"]
+    ao_to_atom = analysis["ao_to_atom"]
+    atom_symbols = analysis["atom_symbols"]
     surface_ao_mask = analysis["surface_ao_mask"]
     coop_results = analysis["coop_results"]
 
@@ -96,10 +161,10 @@ def export_pdos_coop_data(analysis, eps_eV, pdos_atoms, coop_pairs, ewin, sigma=
                 idx = np.where(mask)[0][i]
                 w.writerow([en] + [coop_results[p][idx] for p in coop_results.keys()])
 
-    export_population_bar_plot(analysis, eps_eV, pdos_atoms, ewin, prefix=prefix)
+    export_population_bar_plot(analysis, eps_eV, pdos_atoms, ewin, prefix=prefix, population_bars=population_bars)
 
 
-def export_population_bar_plot(analysis, eps_eV, pdos_atoms, ewin, prefix="sf"):
+def export_population_bar_plot(analysis, eps_eV, pdos_atoms, ewin, prefix="sf", population_bars=None):
     """Export a non-broadened stacked horizontal population bar plot."""
     try:
         import matplotlib
@@ -111,18 +176,43 @@ def export_population_bar_plot(analysis, eps_eV, pdos_atoms, ewin, prefix="sf"):
 
     P_weights = analysis["P_weights"]
     ao_to_sym = analysis["ao_to_sym"]
+    ao_to_atom = analysis["ao_to_atom"]
+    atom_symbols = analysis["atom_symbols"]
+    tagged_entries = _normalize_population_bar_tags(population_bars, atom_symbols)
+    tagged_atom_to_entry = {}
+    for entry_idx, entry in enumerate(tagged_entries):
+        for atom_idx in entry["atom_indices"]:
+            tagged_atom_to_entry[atom_idx] = entry_idx
+
     mask = (eps_eV >= ewin[0]) & (eps_eV <= ewin[1])
     idx = np.where(mask)[0]
     if idx.size == 0:
         return
 
-    labels, weights = [], []
-    for sym in pdos_atoms:
-        ao_idx = np.where(ao_to_sym == sym)[0]
+    labels, weights, colors = [], [], []
+    atom_ids = np.unique(ao_to_atom)
+    atom_weights = {}
+    for atom_id in atom_ids:
+        ao_idx = np.where(ao_to_atom == atom_id)[0]
         if ao_idx.size == 0:
             continue
-        labels.append(sym)
-        weights.append(np.sum(P_weights[ao_idx[:, None], idx], axis=0))
+        atom_weights[int(atom_id)] = np.sum(P_weights[ao_idx[:, None], idx], axis=0)
+
+    used_tagged_atoms = set(tagged_atom_to_entry.keys())
+    for sym in pdos_atoms:
+        atom_idx = np.where(np.array(atom_symbols) == sym)[0]
+        if atom_idx.size == 0:
+            continue
+        base_atom_ids = [int(a) for a in atom_idx if int(a) not in used_tagged_atoms]
+        if base_atom_ids:
+            labels.append(sym)
+            colors.append(PDOS_PALETTE[len(colors) % len(PDOS_PALETTE)])
+            weights.append(np.sum([atom_weights[a] for a in base_atom_ids], axis=0))
+
+    for entry in tagged_entries:
+        labels.append(entry["label"])
+        colors.append(entry["color"])
+        weights.append(np.sum([atom_weights[a] for a in entry["atom_indices"]], axis=0))
 
     if not weights:
         return
@@ -138,11 +228,15 @@ def export_population_bar_plot(analysis, eps_eV, pdos_atoms, ewin, prefix="sf"):
     energies = energies[order]
     frac = frac[order, :]
 
-    if len(energies) > 1:
+    if population_bars and population_bars.get("bar_height") is not None:
+        height = float(population_bars["bar_height"])
+    elif len(energies) > 1:
         span = max(float(ewin[1] - ewin[0]), 1e-6)
         height = min(0.035, max(0.003, 0.75 * span / len(energies)))
     else:
         height = 0.035
+
+    height = max(1e-4, height)
 
     fig_h = max(5.0, min(16.0, 0.018 * len(energies) + 4.0))
     fig, ax = plt.subplots(figsize=(4.2, fig_h))
@@ -150,7 +244,7 @@ def export_population_bar_plot(analysis, eps_eV, pdos_atoms, ewin, prefix="sf"):
     for j, lab in enumerate(labels):
         ax.barh(
             energies, frac[:, j], left=left, height=height,
-            color=PDOS_PALETTE[j % len(PDOS_PALETTE)], edgecolor="none", label=lab
+            color=colors[j], edgecolor="none", label=lab
         )
         left += frac[:, j]
 
@@ -175,7 +269,7 @@ def export_population_bar_plot(analysis, eps_eV, pdos_atoms, ewin, prefix="sf"):
             w.writerow([en] + list(row))
 
 
-def compute_pdos_and_coop(C, S, eps_eV, shells, pdos_atoms, coop_pairs, ewin, sigma=0.03, is_soc=False, prefix="sf", pops=None):
+def compute_pdos_and_coop(C, S, eps_eV, shells, pdos_atoms, coop_pairs, ewin, sigma=0.03, is_soc=False, prefix="sf", pops=None, population_bars=None):
     t0 = time.time()
     print(f"  [PDOS/COOP] Analyzing {len(pdos_atoms)} elements, {len(coop_pairs)} bonds, IPR, and Surface/Core...")
     
@@ -195,7 +289,7 @@ def compute_pdos_and_coop(C, S, eps_eV, shells, pdos_atoms, coop_pairs, ewin, si
             P_weights = np.real(C_dense.conj() * SC)
             
     # --- 0. Fix AO Mapping & Identify Surface AOs ---
-    ao_to_sym, surface_ao_mask = _ao_metadata(shells)
+    ao_to_sym, ao_to_atom, atom_symbols, surface_ao_mask = _ao_metadata(shells)
 
     # --- 4. Compute COOP weights once. QP dashboards reuse these unchanged. ---
     coop_results = {}
@@ -224,12 +318,14 @@ def compute_pdos_and_coop(C, S, eps_eV, shells, pdos_atoms, coop_pairs, ewin, si
     analysis = {
         "P_weights": P_weights,
         "ao_to_sym": ao_to_sym,
+        "ao_to_atom": ao_to_atom,
+        "atom_symbols": atom_symbols,
         "surface_ao_mask": surface_ao_mask,
         "IPR": np.sum(P_weights**2, axis=0),
         "coop_results": coop_results,
     }
 
-    export_pdos_coop_data(analysis, eps_eV, pdos_atoms, coop_pairs, ewin, sigma=sigma, is_soc=is_soc, prefix=prefix)
+    export_pdos_coop_data(analysis, eps_eV, pdos_atoms, coop_pairs, ewin, sigma=sigma, is_soc=is_soc, prefix=prefix, population_bars=population_bars)
                 
     print(f"  [PDOS/COOP] Exported {prefix} data in {time.time() - t0:.2f} s")
     return analysis
