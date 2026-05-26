@@ -7,10 +7,26 @@ from miniBSE.exciton_hamiltonian import ExcitonHamiltonian
 from miniBSE.hardness import build_gamma, build_resta_mnok
 
 
-def _assemble_truncated_exchange(q_hole, w_elec, vi, va, block_size=64):
+def _assemble_truncated_exchange(q_hole, w_elec, vi, va, block_size=128, max_full_elements=12_000_000):
     """Build K[p,q] = sum_A q_hole[i_p,i_q,A]^* W_elec[a_p,a_q,A]."""
     n_p = len(vi)
     dtype = np.result_type(q_hole, w_elec)
+
+    n_occ, _, n_atoms = q_hole.shape
+    n_virt = w_elec.shape[0]
+    full_dim = n_occ * n_virt
+
+    # Dense diagonalization already needs an n_p x n_p matrix.  When the full
+    # occ-virt grid is modest, assemble the cached exchange tensor with one
+    # BLAS-friendly contraction and slice the truncated space from it.  This is
+    # much faster than repeatedly gathering screened pairs into temporary
+    # blocks, which regressed the 2500x2500 dense path.
+    if full_dim * full_dim <= max_full_elements:
+        K_full = np.einsum("ijA,abA->iajb", q_hole.conj(), w_elec, optimize=True)
+        K_2d = K_full.reshape(full_dim, full_dim)
+        idx = vi * n_virt + va
+        return np.ascontiguousarray(K_2d[np.ix_(idx, idx)])
+
     K = np.empty((n_p, n_p), dtype=dtype)
 
     for p0 in range(0, n_p, block_size):
@@ -107,11 +123,9 @@ class ExcitonSolver:
                         print("  [Dense] Building Triplet Exchange matrix (-K)...")
                         t1 = time.time()
                         vi, va = self.ham.valid_i, self.ham.valid_a
-                        n_p = len(vi)
-                        q_occ_sub  = self.ham.q_occ[vi[:, None], vi[None, :], :]
-                        q_virt_sub = self.ham.q_virt[va[:, None], va[None, :], :]
-                        W_sub = (q_virt_sub.reshape(n_p * n_p, -1) @ self.ham.gamma).reshape(n_p, n_p, -1)
-                        K_truncated = np.sum(q_occ_sub * W_sub, axis=-1)
+                        K_truncated = _assemble_truncated_exchange(
+                            self.ham.q_occ, self.ham.W_virt, vi, va
+                        )
                         H -= K_truncated
                         self.K_mat = K_truncated
                         print(f"    -> Triplet K built in {time.time()-t1:.2f}s")
@@ -145,18 +159,16 @@ class ExcitonSolver:
                         # Alpha block K_alpha
                         K_full = np.zeros((self.ham.dim, self.ham.dim))
                         if n_a > 0:
-                            q_occ_sub_a  = self.ham.q_occ_a[vi_a[:, None], vi_a[None, :], :]
-                            q_virt_sub_a = self.ham.q_virt_a[va_a[:, None], va_a[None, :], :]
-                            W_sub_a = (q_virt_sub_a.reshape(n_a * n_a, -1) @ self.ham.gamma).reshape(n_a, n_a, -1)
-                            K_alpha = np.sum(q_occ_sub_a * W_sub_a, axis=-1)
+                            K_alpha = _assemble_truncated_exchange(
+                                self.ham.q_occ_a, self.ham.W_virt_a, vi_a, va_a
+                            )
                             K_full[:dim_a, :dim_a] = K_alpha
 
                         # Beta block K_beta
                         if n_b > 0:
-                            q_occ_sub_b  = self.ham.q_occ_b[vi_b[:, None], vi_b[None, :], :]
-                            q_virt_sub_b = self.ham.q_virt_b[va_b[:, None], va_b[None, :], :]
-                            W_sub_b = (q_virt_sub_b.reshape(n_b * n_b, -1) @ self.ham.gamma).reshape(n_b, n_b, -1)
-                            K_beta = np.sum(q_occ_sub_b * W_sub_b, axis=-1)
+                            K_beta = _assemble_truncated_exchange(
+                                self.ham.q_occ_b, self.ham.W_virt_b, vi_b, va_b
+                            )
                             K_full[dim_a:, dim_a:] = K_beta
 
                         H -= K_full
@@ -179,20 +191,12 @@ class ExcitonSolver:
                     c_x = getattr(self.ham, 'c_x', 1.0) 
                     
                     vi, va = self.ham.valid_i, self.ham.valid_a
-                    n_p = len(vi)
                     
-                    print("    -> Constructing K_truncated natively (Zero-Memory Overhead)...")
+                    print("    -> Constructing K_truncated from cached screened pairs...")
                     t_k = time.time()
-                    
-                    # 1. Slice natively 
-                    q_occ_sub = self.ham.q_occ[vi[:, None], vi[None, :], :]
-                    q_virt_sub = self.ham.q_virt[va[:, None], va[None, :], :]
-                    
-                    # 2. Contract Gamma only for the valid pairs
-                    W_sub = (q_virt_sub.reshape(n_p * n_p, -1) @ self.ham.gamma).reshape(n_p, n_p, -1)
-                    
-                    # 3. Element-wise multiply and sum
-                    K_truncated = np.sum(q_occ_sub * W_sub, axis=-1)
+                    K_truncated = _assemble_truncated_exchange(
+                        self.ham.q_occ, self.ham.W_virt, vi, va
+                    )
                     
                     print(f"    -> K_truncated assembled in {time.time()-t_k:.2f}s")
                     
